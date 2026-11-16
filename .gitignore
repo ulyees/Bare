@@ -1,0 +1,16 @@
+# 构建产物
+*.obj
+*.o
+*.res
+*.pdb
+*.ilk
+*.exp
+*.exe
+
+# 但保留可直接下载的免安装程序
+!Bare.exe
+
+# 系统杂项
+Thumbs.db
+desktop.ini
+.DS_Store
