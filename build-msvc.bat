@@ -19,6 +19,6 @@ echo [1/2] resources...
 rc /nologo /fo app_res.res app.rc
 if errorlevel 1 exit /b 1
 echo [2/2] compile Bare.exe...
-cl /nologo /O2 /MT /EHsc /std:c++17 /utf-8 Bare.cpp app_res.res /link /SUBSYSTEM:WINDOWS /OUT:Bare.exe user32.lib gdi32.lib comdlg32.lib dwmapi.lib shell32.lib advapi32.lib
+cl /nologo /O2 /MT /EHsc /std:c++17 /utf-8 Bare.cpp app_res.res /link /SUBSYSTEM:WINDOWS /OUT:Bare.exe user32.lib gdi32.lib comdlg32.lib dwmapi.lib shell32.lib advapi32.lib ole32.lib uuid.lib
 if errorlevel 1 exit /b 1
 echo OK: Bare.exe

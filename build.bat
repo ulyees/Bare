@@ -15,7 +15,7 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-g++ -std=c++17 -O2 -s -mwindows -static Bare.cpp app_res.o -o Bare.exe -lcomdlg32 -ldwmapi -lshell32 -ladvapi32 -lgdi32 -luser32
+g++ -std=c++17 -O2 -s -mwindows -static Bare.cpp app_res.o -o Bare.exe -lcomdlg32 -ldwmapi -lshell32 -ladvapi32 -lgdi32 -luser32 -lole32 -luuid
 if errorlevel 1 (
   echo [错误] 编译失败
   pause
