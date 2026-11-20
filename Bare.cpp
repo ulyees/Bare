@@ -1782,13 +1782,15 @@ static void CloseGoto() {
 // 编码 / 换行菜单
 // -----------------------------------------------------------------------------
 static void ShowEncodingMenu(POINT pt) {
+    POINT sp = pt;
+    ClientToScreen(g.hwnd, &sp);
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, 1, L"自动检测（重新载入）");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     const wchar_t* names[] = { L"UTF-8", L"UTF-16 LE", L"UTF-16 BE", L"ANSI / GBK", L"字节模式" };
     for (int k = 0; k < 5; ++k) AppendMenuW(m, MF_STRING, 10 + k, names[k]);
-    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
-                                  pt.x, pt.y, 0, g.hwnd, nullptr);
+    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_BOTTOMALIGN,
+                                  sp.x, sp.y, 0, g.hwnd, nullptr);
     DestroyMenu(m);
     if (cmd == 1) ReloadWithEncoding(-1);
     else if (cmd >= 10) ReloadWithEncoding(cmd - 10);
@@ -1819,13 +1821,15 @@ static void ConvertEol(bool toCrlf) {
 }
 
 static void ShowEolMenu(POINT pt) {
+    POINT sp = pt;
+    ClientToScreen(g.hwnd, &sp);
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, 1, L"转换为 CRLF（Windows）");
     AppendMenuW(m, MF_STRING, 2, L"转换为 LF（Unix）");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (g.showEol ? MF_CHECKED : 0), 3, L"显示行尾符号");
-    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
-                                  pt.x, pt.y, 0, g.hwnd, nullptr);
+    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_BOTTOMALIGN,
+                                  sp.x, sp.y, 0, g.hwnd, nullptr);
     DestroyMenu(m);
     if (cmd == 1) ConvertEol(true);
     else if (cmd == 2) ConvertEol(false);
@@ -2879,11 +2883,19 @@ static void StartRename() {
     }
     std::wstring name = g.path.empty() ? std::wstring(L"未命名") : FileName(g.path);
     SetWindowTextW(g.hRename, name.c_str());
+    // 编辑框精确覆盖文件名胶囊：文字起点与常态完全一致，避免点击后文字“跳位”
     RECT r = FileNameRect();
-    int w = std::max(MulDiv(120, g.dpi, 96), (int)(r.right - r.left) - MulDiv(6, g.dpi, 96));
-    int h = MulDiv(26, g.dpi, 96);
-    SetWindowPos(g.hRename, HWND_TOP, r.left + MulDiv(2, g.dpi, 96),
-                 (g.toolbarH - h) / 2, w, h, SWP_SHOWWINDOW);
+    if (r.right <= r.left) {                       // 胶囊隐藏时退化为默认区域
+        r.left = MulDiv(18, g.dpi, 96);
+        r.right = r.left + MulDiv(180, g.dpi, 96);
+    }
+    RECT pill = { r.left, MulDiv(7, g.dpi, 96), r.right, g.toolbarH - MulDiv(7, g.dpi, 96) };
+    SetWindowPos(g.hRename, HWND_TOP, pill.left, pill.top,
+                 std::max(MulDiv(120, g.dpi, 96), (int)(pill.right - pill.left)),
+                 pill.bottom - pill.top, SWP_SHOWWINDOW);
+    // 与胶囊内文字相同的左边距（去掉 EDIT 自身 1~2px 边框影响）
+    SendMessageW(g.hRename, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                 MAKELONG(std::max(0, MulDiv(11, g.dpi, 96)), MulDiv(8, g.dpi, 96)));
     SendMessageW(g.hRename, EM_SETSEL, 0, -1);
     SetFocus(g.hRename);
     InvalidateRect(g.hwnd, nullptr, FALSE);
@@ -2893,6 +2905,8 @@ static void StartRename() {
 // 右键菜单
 // -----------------------------------------------------------------------------
 static void ShowContextMenu(POINT pt) {
+    POINT sp = pt;
+    ClientToScreen(g.hwnd, &sp);
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING | (g.undo.empty() ? MF_GRAYED : 0), 1, L"撤销\tCtrl+Z");
     AppendMenuW(m, MF_STRING | (g.redo.empty() ? MF_GRAYED : 0), 2, L"重做\tCtrl+Y");
@@ -2905,7 +2919,7 @@ static void ShowContextMenu(POINT pt) {
     AppendMenuW(m, MF_STRING, 7, L"查找\tCtrl+F");
     AppendMenuW(m, MF_STRING, 8, L"查找并替换\tCtrl+H");
     int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                                  pt.x, pt.y, 0, g.hwnd, nullptr);
+                                  sp.x, sp.y, 0, g.hwnd, nullptr);
     DestroyMenu(m);
     switch (cmd) {
         case 1: UndoRedo(false); break;
