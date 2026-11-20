@@ -9,9 +9,8 @@ Bare · 极简文本编辑器
 - 撤销 Ctrl+Z、重做 Ctrl+Y，最多 4000 步
 - 查找替换 Ctrl+F / Ctrl+H，纯文本匹配
 - 自动换行、窗口置顶、窗口位置与大小记忆
-- 点击文件名可直接重命名
+- 点击文件名可直接重命名，Ctrl+G 跳转行:列
 - 状态栏：行/列 · 行数 · 编码 · 换行符 · 修改状态
 
 Ctrl+N 新建    Ctrl+O 打开    Ctrl+S 保存
-Ctrl+Shift+S 另存为    Ctrl+F 查找    Ctrl+H 替换
-Ctrl+T 置顶    Ctrl+Z 撤销    Ctrl+Y 重做
+Ctrl+Shift+S 另存为    Ctrl+F 查找

@@ -116,6 +116,13 @@ struct App {
     int gutterW = 56, toolbarH = 44, statusH = 26, findH = 40;
     int clientW = 0, clientH = 0;
 
+    int hoverStatus = 0;                           // 状态栏悬停：1 位置 2 编码 3 换行
+    bool gotoOpen = false;                         // 跳转栏
+    std::wstring gotoText;
+    bool hsDrag = false;                           // 横向滚动条拖拽
+    int hsGrab = 0;
+    bool hoverHs = false;
+
     int hoverBtn = 0, downBtn = 0;                 // 1打开 2保存 3另存为 4置顶 5换行
     bool hoverName = false;
     bool hoverFind = false;
@@ -146,6 +153,7 @@ struct App {
     COLORREF cSel = 0, cSelText = 0, cCurLine = 0, cCaret = 0;
     COLORREF cField = 0, cFieldBorder = 0, cFieldText = 0, cPh = 0;
     COLORREF cFind = 0, cFindText = 0, cAccent = 0;
+    COLORREF cChip = 0, cChipBorder = 0, cHsTrack = 0, cHsThumb = 0;
 };
 static App g;
 
@@ -1110,12 +1118,28 @@ static void NewFile() {
 // -----------------------------------------------------------------------------
 // 视图布局（支持自动换行）
 // -----------------------------------------------------------------------------
+static int FitWidth() {
+    int w = g.clientW - g.gutterW - MulDiv(24, g.dpi, 96);
+    return std::max(g.charW * 4, w);
+}
+
 static int TextTop() {
-    return g.toolbarH + (g.find.open ? g.findH : 0);
+    return g.toolbarH + ((g.find.open || g.gotoOpen) ? g.findH : 0);
+}
+
+// 横向滚动条：仅在非自动换行且内容超宽时出现
+static int HScrollH() {
+    if (g.wrap) return 0;
+    return (g.maxLinePx > FitWidth()) ? MulDiv(13, g.dpi, 96) : 0;
 }
 
 static int TextBottom() {
-    return g.clientH - g.statusH;
+    return g.clientH - g.statusH - HScrollH();
+}
+
+static int MaxHOffset() {
+    int over = g.maxLinePx - FitWidth();
+    return over > 0 ? over : 0;
 }
 
 static int VisLines() {
@@ -1125,11 +1149,6 @@ static int VisLines() {
 static int MaxTop() {
     size_t n = g.lines.empty() ? 0 : g.lines.size() - 1;
     return (int)std::min<size_t>(n, INT_MAX);
-}
-
-static int FitWidth() {
-    int w = g.clientW - g.gutterW - MulDiv(24, g.dpi, 96);
-    return std::max(g.charW * 4, w);
 }
 
 // 测量专用 DC（屏幕兼容），避免反复 GetDC
@@ -1277,7 +1296,7 @@ static void EnsureCaretVisible() {
         int viewW = std::max(40, g.clientW - g.gutterW - 10);
         if (cx - g.xOffset < 0) g.xOffset = cx;
         if (cx - g.xOffset > viewW - 4) g.xOffset = cx - viewW + 40;
-        if (g.xOffset < 0) g.xOffset = 0;
+        g.xOffset = std::clamp(g.xOffset, 0, MaxHOffset());
     }
 }
 
@@ -1522,6 +1541,7 @@ static void SyncFindHeight() {
 
 static void OpenFind(bool replaceMode) {
     bool was = g.find.open;
+    if (g.gotoOpen) { g.gotoOpen = false; g.gotoText.clear(); }
     g.find.open = true;
     if (replaceMode) {
         g.find.replaceMode = true;
@@ -1678,6 +1698,84 @@ static FindLayout FindRects() {
         L.repField = { pad, y2, pad + fw2, y2 + rh };
     }
     return L;
+}
+
+// -----------------------------------------------------------------------------
+// 跳转栏（Ctrl+G / 点击状态栏位置）
+// -----------------------------------------------------------------------------
+struct GotoLayout { RECT field, go, close, hint; };
+
+static GotoLayout GotoRects() {
+    const int rh  = MulDiv(26, g.dpi, 96);
+    const int pad = MulDiv(10, g.dpi, 96);
+    const int gap = MulDiv(8, g.dpi, 96);
+    const int y1  = g.toolbarH + pad;
+    GotoLayout L = {};
+    int x = g.clientW - pad;
+    L.close = { x - rh, y1, x, y1 + rh }; x -= rh + gap * 2;
+    int bw = MulDiv(64, g.dpi, 96);
+    L.go = { x - bw, y1, x, y1 + rh }; x -= bw + MulDiv(14, g.dpi, 96);
+    int hintW = MulDiv(154, g.dpi, 96);
+    L.hint = { x - hintW, y1, x, y1 + rh }; x -= hintW + gap;
+    int avail = std::max(MulDiv(90, g.dpi, 96), x - pad);
+    int fw = std::min(MulDiv(380, g.dpi, 96), avail);
+    L.field = { pad, y1, pad + fw, y1 + rh };
+    return L;
+}
+
+static void CloseGoto();
+
+static void DoGoto() {
+    const std::wstring& s = g.gotoText;
+    size_t i = 0;
+    auto skipSp = [&]() { while (i < s.size() && (s[i] == L' ' || s[i] == L'\t')) ++i; };
+    auto readNum = [&](long& out) {
+        bool any = false; out = 0;
+        while (i < s.size() && s[i] >= L'0' && s[i] <= L'9') {
+            out = std::min(2000000000L, out * 10 + (s[i] - L'0'));
+            ++i; any = true;
+        }
+        return any;
+    };
+    skipSp();
+    long line = 1, col = 1;
+    if (!readNum(line)) { CloseGoto(); return; }
+    skipSp();
+    if (i < s.size() && (s[i] == L':' || s[i] == L',')) {
+        ++i; skipSp();
+        if (!readNum(col)) col = 1;
+    }
+    CloseGoto();
+    if (g.lines.empty()) return;
+    const size_t l = (size_t)std::min<long>(std::max<long>(line, 1) - 1, (long)g.lines.size() - 1);
+    const size_t vl = VLen(g.lines[l]);
+    size_t c = (size_t)std::max<long>(col, 1) - 1;
+    if (c > vl) c = vl;
+    g.hasSel = false;
+    g.curL = l;
+    g.curC = c;
+    g.topL = (l > 3) ? l - 3 : 0;      // 目标行上方保留几行上下文
+    g.desiredX = -1;
+    Refresh();
+}
+
+static void OpenGoto() {
+    if (g.find.open) CloseFind();
+    g.gotoOpen = true;
+    g.gotoText.clear();
+    SetFocus(g.hwnd);
+    EnsureCaretVisible();
+    UpdateScroll();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
+static void CloseGoto() {
+    g.gotoOpen = false;
+    g.gotoText.clear();
+    SetFocus(g.hwnd);
+    EnsureCaretVisible();
+    UpdateScroll();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
 // -----------------------------------------------------------------------------
@@ -1960,6 +2058,8 @@ static void InitColors() {
         g.cFieldText = RGB(222, 222, 226); g.cPh = RGB(120, 124, 132);
         g.cFind = RGB(96, 80, 26);     g.cFindText = RGB(255, 255, 255);
         g.cAccent = RGB(84, 148, 255);
+        g.cChip = RGB(52, 52, 55);     g.cChipBorder = RGB(74, 74, 80);
+        g.cHsTrack = RGB(43, 43, 43);  g.cHsThumb = RGB(82, 82, 88);
     } else {
         g.cBg = RGB(255, 255, 255);    g.cText = RGB(28, 30, 34);
         g.cGutter = RGB(250, 250, 252);g.cGutterText = RGB(168, 172, 181);
@@ -1973,6 +2073,8 @@ static void InitColors() {
         g.cFieldText = RGB(28, 30, 34); g.cPh = RGB(162, 166, 175);
         g.cFind = RGB(255, 226, 138);  g.cFindText = RGB(28, 30, 34);
         g.cAccent = RGB(40, 100, 220);
+        g.cChip = RGB(240, 241, 246);  g.cChipBorder = RGB(226, 228, 235);
+        g.cHsTrack = RGB(246, 247, 250); g.cHsThumb = RGB(203, 206, 216);
     }
 }
 
@@ -1991,18 +2093,31 @@ static bool SystemDark() {
 // -----------------------------------------------------------------------------
 // 工具栏 / 状态栏布局
 // -----------------------------------------------------------------------------
+// 工具栏按钮宽度随窗口宽度自适应（窄窗口也不越界）
+static int ToolBtnW(int cw) {
+    const int right   = MulDiv(14, g.dpi, 96);
+    const int gap     = MulDiv(8, g.dpi, 96);
+    const int leftMin = MulDiv(136, g.dpi, 96);
+    const int lo = MulDiv(44, g.dpi, 96), hi = MulDiv(74, g.dpi, 96);
+    int avail = cw - right - gap * 5 - leftMin;
+    return std::clamp(avail / 5, lo, hi);
+}
+
 static RECT BtnRect(int id, int cw) {
-    const int w = MulDiv(72, g.dpi, 96), h = MulDiv(30, g.dpi, 96);
+    const int w = ToolBtnW(cw), h = MulDiv(30, g.dpi, 96);
     const int gap = MulDiv(8, g.dpi, 96), right = MulDiv(14, g.dpi, 96);
     int x = cw - right - w - (5 - id) * (gap + w);
     int y = (g.toolbarH - h) / 2;
     return RECT{ x, y, x + w, y + h };
 }
 
+// 文件名胶囊；窗口过窄时返回零宽矩形（隐藏）
 static RECT FileNameRect() {
+    if (g.hRename && IsWindowVisible(g.hRename)) return RECT{ 0, 0, 0, 0 };
     RECT b = BtnRect(1, g.clientW);
     LONG left = MulDiv(18, g.dpi, 96);
-    LONG right = std::max(left, b.left - MulDiv(16, g.dpi, 96));
+    LONG right = b.left - MulDiv(16, g.dpi, 96);
+    if (right - left < MulDiv(84, g.dpi, 96)) return RECT{ 0, 0, 0, 0 };
     return RECT{ left, 0, right, g.toolbarH };
 }
 
@@ -2031,25 +2146,34 @@ static void DrawToolbar(HDC h) {
     Fill(h, 0, 0, g.clientW, g.toolbarH, g.cBar);
     Line(h, 0, g.toolbarH - 1, g.clientW, g.toolbarH - 1, g.cSep);
 
-    if (g.hRename && IsWindowVisible(g.hRename)) {
-        // 内联重命名时文件名由编辑框显示
-    } else {
+    RECT t = FileNameRect();
+    if (!(g.hRename && IsWindowVisible(g.hRename)) && t.right > t.left) {
+        // 文件名胶囊
+        RECT pill = { t.left, MulDiv(7, g.dpi, 96), t.right, g.toolbarH - MulDiv(7, g.dpi, 96) };
+        HBRUSH cb = CreateSolidBrush(g.hoverName ? g.cBtnHover : g.cChip);
+        HPEN   cp = CreatePen(PS_SOLID, 1, g.hoverName ? g.cBtnBorder : g.cChipBorder);
+        HGDIOBJ ob = SelectObject(h, cb), op = SelectObject(h, cp);
+        RoundRect(h, pill.left, pill.top, pill.right, pill.bottom,
+                  pill.bottom - pill.top, pill.bottom - pill.top);
+        SelectObject(h, ob); SelectObject(h, op);
+        DeleteObject(cb); DeleteObject(cp);
+
         std::wstring name = g.path.empty() ? L"未命名" : FileName(g.path);
-        RECT t = FileNameRect();
-        RECT tr = { t.left + MulDiv(8, g.dpi, 96), 0,
-                    t.right - MulDiv(6, g.dpi, 96), g.toolbarH };
+        const int padX  = MulDiv(12, g.dpi, 96);
+        const int iconW = g.hoverName ? MulDiv(20, g.dpi, 96) : 0;
+        RECT tr = { pill.left + padX, pill.top, pill.right - padX - iconW, pill.bottom };
         SetTextColor(h, g.cBarText);
         HGDIOBJ of = SelectObject(h, g.hUIBold);
         DrawTextW(h, name.c_str(), -1, &tr,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(h, of);
         if (g.hoverName) {
-            SIZE sz = { 0, 0 };
-            HGDIOBJ of2 = SelectObject(h, g.hUIBold);
-            GetTextExtentPoint32W(h, name.c_str(), (int)name.size(), &sz);
+            SetTextColor(h, g.cAccent);
+            RECT ir = { pill.right - padX - iconW + MulDiv(2, g.dpi, 96), pill.top,
+                        pill.right - padX + MulDiv(4, g.dpi, 96), pill.bottom };
+            HGDIOBJ of2 = SelectObject(h, g.hUI);
+            DrawTextW(h, L"\u270E", -1, &ir, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             SelectObject(h, of2);
-            Line(h, tr.left, g.toolbarH - MulDiv(9, g.dpi, 96),
-                 tr.left + sz.cx, g.toolbarH - MulDiv(9, g.dpi, 96), g.cAccent);
         }
     }
 
@@ -2078,53 +2202,150 @@ static StatusLayout StatusRects(HDC hdc, int y) {
     std::wstring sEol = g.eolName;
     std::wstring sDirty = g.dirty ? L"已修改" : L"未修改";
     if (!g.flash.empty() && GetTickCount64() < g.flashUntil) sDirty = g.flash;
+    int pad = MulDiv(18, g.dpi, 96);
+    int wPos = TW(hdc, sPos), wLines = TW(hdc, sLines), wEnc = TW(hdc, sEnc);
+    int wEol = TW(hdc, sEol), wDirty = TW(hdc, sDirty);
+    int rightSide = TW(hdc, FmtSize(g.fileSize)) + MulDiv(56, g.dpi, 96);
+    int avail = g.clientW - MulDiv(14, g.dpi, 96) - rightSide;
+    int total = wPos + wLines + wEnc + wEol + wDirty + pad * 4;
+    bool showLines = true, showEnc = true, showEol = true;
+    while (total > avail) {                      // 溢出时依次隐藏：换行 → 行数 → 编码
+        if (showEol)        { showEol = false;   total -= wEol + pad; }
+        else if (showLines) { showLines = false; total -= wLines + pad; }
+        else if (showEnc)   { showEnc = false;   total -= wEnc + pad; }
+        else break;
+    }
     int x = MulDiv(14, g.dpi, 96);
-    int pad = MulDiv(16, g.dpi, 96);
-    auto place = [&](const std::wstring& s, RECT& r) {
-        int w = TW(hdc, s);
+    auto place = [&](int w, RECT& r) {
         r = { x, y, x + w, y + g.statusH };
         x += w + pad;
     };
-    place(sPos, L.pos);
-    place(sLines, L.lines);
-    place(sEnc, L.enc);
-    place(sEol, L.eol);
-    place(sDirty, L.dirty);
+    place(wPos, L.pos);
+    if (showLines) place(wLines, L.lines); else L.lines = {};
+    if (showEnc)   place(wEnc, L.enc);     else L.enc = {};
+    if (showEol)   place(wEol, L.eol);     else L.eol = {};
+    place(wDirty, L.dirty);
     SelectObject(hdc, of);
     return L;
 }
 
 static void DrawStatus(HDC h) {
-    int y = g.clientH - g.statusH;
+    const int y = g.clientH - g.statusH;
+    const int dpi = g.dpi;
     Fill(h, 0, y, g.clientW, g.clientH, g.cBar);
     Line(h, 0, y, g.clientW, y, g.cSep);
     StatusLayout L = StatusRects(h, y);
+
+    // 可点击分段的悬停高亮
+    auto hoverBg = [&](const RECT& r, int id) {
+        if (g.hoverStatus != id || r.right <= r.left) return;
+        RECT rr = { r.left - MulDiv(7, dpi, 96), y + MulDiv(4, dpi, 96),
+                    r.right + MulDiv(7, dpi, 96), y + g.statusH - MulDiv(4, dpi, 96) };
+        HBRUSH b = CreateSolidBrush(g.cBtnHover);
+        HPEN   p = CreatePen(PS_SOLID, 1, g.cBtnHover);
+        HGDIOBJ ob = SelectObject(h, b), op = SelectObject(h, p);
+        RoundRect(h, rr.left, rr.top, rr.right, rr.bottom,
+                  MulDiv(7, dpi, 96), MulDiv(7, dpi, 96));
+        SelectObject(h, ob); SelectObject(h, op);
+        DeleteObject(b); DeleteObject(p);
+    };
+    hoverBg(L.pos, 1); hoverBg(L.enc, 2); hoverBg(L.eol, 3);
+
     HGDIOBJ of = SelectObject(h, g.hUI);
-    SetTextColor(h, g.cStatusText);
+    SetTextColor(h, g.hoverStatus == 1 ? g.cBarText : g.cStatusText);
     DrawTextW(h, (L"行 " + std::to_wstring(g.curL + 1) + L", 列 " + std::to_wstring(g.curC + 1)).c_str(),
               -1, &L.pos, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextW(h, (std::to_wstring(g.lines.size()) + L" 行").c_str(), -1, &L.lines,
-              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextW(h, g.enc.Name(), -1, &L.enc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    DrawTextW(h, g.eolName.c_str(), -1, &L.eol, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    if (L.lines.right > L.lines.left) {
+        SetTextColor(h, g.cStatusText);
+        DrawTextW(h, (std::to_wstring(g.lines.size()) + L" 行").c_str(), -1, &L.lines,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+    if (L.enc.right > L.enc.left) {
+        SetTextColor(h, g.hoverStatus == 2 ? g.cBarText : g.cStatusText);
+        DrawTextW(h, g.enc.Name(), -1, &L.enc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+    if (L.eol.right > L.eol.left) {
+        SetTextColor(h, g.hoverStatus == 3 ? g.cBarText : g.cStatusText);
+        DrawTextW(h, g.eolName.c_str(), -1, &L.eol, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
     bool flashing = !g.flash.empty() && GetTickCount64() < g.flashUntil;
     SetTextColor(h, flashing ? g.cAccent : (g.dirty ? g.cAccent : g.cStatusText));
     std::wstring sDirty = flashing ? g.flash : (g.dirty ? L"已修改" : L"未修改");
     DrawTextW(h, sDirty.c_str(), -1, &L.dirty, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    // 分段竖线
-    const RECT* seps[] = { &L.pos, &L.lines, &L.enc, &L.eol };
+    // 分段之间的圆点
+    const RECT* segs[] = { &L.lines, &L.enc, &L.eol, &L.dirty };
+    int prevRight = L.pos.right;
     for (int k = 0; k < 4; ++k) {
-        int sx = (k == 3 ? L.dirty.left : seps[k + 1]->left) - MulDiv(8, g.dpi, 96);
-        Line(h, sx, y + g.statusH / 3, sx, y + g.statusH * 2 / 3, g.cSep);
+        const RECT& r = *segs[k];
+        if (r.right <= r.left) continue;
+        int cx = (prevRight + r.left) / 2;
+        Fill(h, cx - MulDiv(1, dpi, 96), y + g.statusH / 2 - MulDiv(1, dpi, 96),
+             cx + MulDiv(1, dpi, 96), y + g.statusH / 2 + MulDiv(1, dpi, 96), g.cSep);
+        prevRight = r.right;
     }
 
-    // 右侧文件大小
+    // 右侧文件大小（空间不足时省略）
     std::wstring right = FmtSize(g.fileSize);
-    SetTextColor(h, g.cStatusText);
-    RECT rr = { g.clientW - MulDiv(160, g.dpi, 96), y, g.clientW - MulDiv(14, g.dpi, 96), g.clientH };
-    DrawTextW(h, right.c_str(), -1, &rr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    int sizeW = TW(h, right);
+    int limit = g.clientW - MulDiv(14, dpi, 96);
+    if (L.dirty.right + MulDiv(20, dpi, 96) < limit - sizeW) {
+        SetTextColor(h, g.cStatusText);
+        RECT rr = { limit - sizeW - MulDiv(30, dpi, 96), y, limit, g.clientH };
+        DrawTextW(h, right.c_str(), -1, &rr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
     SelectObject(h, of);
+}
+
+static int StatusHitId(const POINT& pt) {
+    StatusLayout L = StatusRects(MeasureDC(), g.clientH - g.statusH);
+    if (L.pos.right > L.pos.left && PtInRect(&L.pos, pt)) return 1;
+    if (L.enc.right > L.enc.left && PtInRect(&L.enc, pt)) return 2;
+    if (L.eol.right > L.eol.left && PtInRect(&L.eol, pt)) return 3;
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// 横向滚动条
+// -----------------------------------------------------------------------------
+static RECT HScrollRect() {
+    int hh = HScrollH();
+    if (hh <= 0) return RECT{ 0, 0, 0, 0 };
+    int y = g.clientH - g.statusH - hh;
+    return RECT{ g.gutterW, y, g.clientW, y + hh };
+}
+
+static RECT HThumbRect() {
+    RECT tr = HScrollRect();
+    if (tr.right <= tr.left) return tr;
+    const int pad = MulDiv(6, g.dpi, 96);
+    int trackL = tr.left + pad, trackR = tr.right - pad;
+    int span = trackR - trackL;
+    if (span < 10) return RECT{ 0, 0, 0, 0 };
+    int over = MaxHOffset();
+    int content = FitWidth() + over;
+    int tw = std::clamp((int)((long long)span * FitWidth() / std::max(1, content)),
+                        MulDiv(36, g.dpi, 96), span);
+    int t = over > 0 ? (int)((long long)(span - tw) * g.xOffset / over) : 0;
+    int y = tr.top + MulDiv(4, g.dpi, 96);
+    return RECT{ trackL + t, y, trackL + t + tw, y + MulDiv(5, g.dpi, 96) };
+}
+
+static void DrawHScroll(HDC h) {
+    RECT tr = HScrollRect();
+    if (tr.right <= tr.left) return;
+    Fill(h, 0, tr.top, g.clientW, tr.bottom, g.cBg);
+    Fill(h, g.gutterW, tr.top, g.clientW, tr.top + 1, g.cSep);
+    RECT th = HThumbRect();
+    if (th.right <= th.left) return;
+    COLORREF c = (g.hoverHs || g.hsDrag) ? g.cBtnDown : g.cHsThumb;
+    HBRUSH b = CreateSolidBrush(c);
+    HPEN p = CreatePen(PS_SOLID, 1, c);
+    HGDIOBJ ob = SelectObject(h, b), op = SelectObject(h, p);
+    int rad = th.bottom - th.top;
+    RoundRect(h, th.left, th.top, th.right, th.bottom, rad, rad);
+    SelectObject(h, ob); SelectObject(h, op);
+    DeleteObject(b); DeleteObject(p);
 }
 
 // 输入框（查找栏）
@@ -2220,6 +2441,41 @@ static void DrawFindBar(HDC h) {
     SelectObject(h, ofUI);
 }
 
+static void DrawGotoBar(HDC h) {
+    const int top = g.toolbarH;
+    Fill(h, 0, top, g.clientW, top + g.findH, g.cBar);
+    Line(h, 0, top + g.findH - 1, g.clientW, top + g.findH - 1, g.cSep);
+    GotoLayout L = GotoRects();
+
+    HGDIOBJ of = SelectObject(h, g.hUI);
+    SetBkMode(h, TRANSPARENT);
+    DrawField(h, L.field, g.gotoText, L"跳转到 行:列，例如 12:34", true, g.caretOn);
+    SetTextColor(h, g.cPh);
+    DrawTextW(h, L"Enter 跳转 · Esc 关闭", -1, &L.hint,
+              DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    auto btn = [&](const RECT& r, int id, const wchar_t* text) {
+        if (g.hoverFindBtn == id) {
+            HBRUSH hb = CreateSolidBrush(g.cBtnHover);
+            HPEN hp = CreatePen(PS_SOLID, 1, g.cBtnBorder);
+            HGDIOBJ o = SelectObject(h, hb);
+            HGDIOBJ p = SelectObject(h, hp);
+            RoundRect(h, r.left, r.top, r.right, r.bottom,
+                      MulDiv(6, g.dpi, 96), MulDiv(6, g.dpi, 96));
+            SelectObject(h, o);
+            SelectObject(h, p);
+            DeleteObject(hb);
+            DeleteObject(hp);
+        }
+        SetTextColor(h, g.cBarText);
+        RECT rr = r;
+        DrawTextW(h, text, -1, &rr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    };
+    btn(L.go, 8, L"跳转");
+    btn(L.close, 4, L"×");
+    SelectObject(h, of);
+}
+
 static void Paint(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
@@ -2236,7 +2492,7 @@ static void Paint(HWND hwnd) {
 
     Fill(mem, 0, 0, rc.right, rc.bottom, g.cBg);
     int textTop = TextTop();
-    int textBottom = std::max<int>(textTop, (int)(rc.bottom - g.statusH));
+    int textBottom = std::max<int>(textTop, TextBottom());
     Fill(mem, 0, textTop, g.gutterW, textBottom, g.cGutter);
     Line(mem, g.gutterW - 1, textTop, g.gutterW - 1, textBottom, g.cSep);
 
@@ -2362,7 +2618,7 @@ static void Paint(HWND hwnd) {
     }
 
     // 自绘闪烁光标
-    if (caretDrawn && !g.find.open && g.hasFocus && g.caretOn) {
+    if (caretDrawn && !g.find.open && !g.gotoOpen && g.hasFocus && g.caretOn) {
         Fill(mem, caretX, caretY + MulDiv(2, g.dpi, 96),
              caretX + std::max(1, MulDiv(2, g.dpi, 96)),
              caretY + g.lineH - MulDiv(3, g.dpi, 96), g.cCaret);
@@ -2387,8 +2643,10 @@ static void Paint(HWND hwnd) {
     }
 
     SelectObject(mem, of);
+    DrawHScroll(mem);
     DrawToolbar(mem);
     if (g.find.open) DrawFindBar(mem);
+    if (g.gotoOpen) DrawGotoBar(mem);
     DrawStatus(mem);
 
     BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
@@ -2699,7 +2957,7 @@ static void CheckExternalChange() {
 }
 
 static bool WantTextArea(int y) {
-    return y >= TextTop() && y < g.clientH - g.statusH;
+    return y >= TextTop() && y < TextBottom();
 }
 
 // -----------------------------------------------------------------------------
@@ -2848,6 +3106,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CHAR: {
             wchar_t ch = (wchar_t)wp;
             if (ch < 32) return 0;
+            if (g.gotoOpen) {
+                if ((ch >= L'0' && ch <= L'9') || ch == L':' || ch == L',' || ch == L' ') {
+                    if (g.gotoText.size() < 16) g.gotoText.push_back(ch);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
             if (g.find.open) {
                 if (g.find.activeField == 0) g.find.q.push_back(ch);
                 else g.find.rep.push_back(ch);
@@ -2870,6 +3135,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                            wp == VK_LEFT || wp == VK_RIGHT || wp == VK_UP || wp == VK_DOWN ||
                            wp == VK_HOME || wp == VK_END || wp == VK_PRIOR || wp == VK_NEXT);
             if (navKey && ImeComposing()) break;
+
+            if (g.gotoOpen) {
+                if (wp == VK_ESCAPE) { CloseGoto(); return 0; }
+                if (wp == VK_RETURN) { DoGoto(); return 0; }
+                if (wp == VK_BACK) {
+                    if (!g.gotoText.empty()) { g.gotoText.pop_back(); InvalidateRect(hwnd, nullptr, FALSE); }
+                    return 0;
+                }
+                if (ctrl) {
+                    switch (wp) {
+                        case L'G': DoGoto(); return 0;
+                        case L'S': if (shift) SaveFile(true); else SaveFile(false); return 0;
+                        case L'O': OpenDialog(); return 0;
+                        case L'N': NewFile(); return 0;
+                        default: break;
+                    }
+                }
+                return 0;
+            }
 
             if (g.find.open) {
                 if (wp == VK_ESCAPE) { CloseFind(); return 0; }
@@ -2898,6 +3182,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         case L'S': if (shift) SaveFile(true); else SaveFile(false); return 0;
                         case L'O': OpenDialog(); return 0;
                         case L'N': NewFile(); return 0;
+                        case L'G': OpenGoto(); return 0;
                         case L'H':
                             g.find.replaceMode = !g.find.replaceMode;
                             if (!g.find.replaceMode) g.find.activeField = 0;
@@ -2921,6 +3206,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     case L'S': if (shift) SaveFile(true); else SaveFile(false); return 0;
                     case L'F': OpenFind(false); return 0;
                     case L'H': OpenFind(true); return 0;
+                    case L'G': OpenGoto(); return 0;
                     case L'A': SelectAll(); return 0;
                     case L'C': CopySel(false); return 0;
                     case L'X': CopySel(true); return 0;
@@ -2988,9 +3274,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
 
+            if (g.gotoOpen && y >= g.toolbarH && y < TextTop()) {
+                GotoLayout gl = GotoRects();
+                if (PtInRect(&gl.go, pt)) DoGoto();
+                else if (PtInRect(&gl.close, pt)) CloseGoto();
+                else if (PtInRect(&gl.field, pt)) SetFocus(hwnd);
+                return 0;
+            }
+
             if (y < g.toolbarH) {
                 RECT fn = FileNameRect();
-                if (PtInRect(&fn, pt)) { StartRename(); return 0; }
+                if (fn.right > fn.left && PtInRect(&fn, pt)) { StartRename(); return 0; }
                 int id = HitButton(x, y);
                 if (id) {
                     g.downBtn = id;
@@ -3009,14 +3303,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
 
-            if (y >= g.clientH - g.statusH) {
-                StatusLayout L = StatusRects(MeasureDC(), g.clientH - g.statusH);
-                if (PtInRect(&L.enc, pt)) { ShowEncodingMenu(pt); return 0; }
-                if (PtInRect(&L.eol, pt)) { ShowEolMenu(pt); return 0; }
+            RECT trc = HScrollRect();
+            if (trc.right > trc.left && y >= trc.top && y < trc.bottom) {
+                RECT th = HThumbRect();
+                if (th.right > th.left && PtInRect(&th, pt)) {
+                    g.hsDrag = true;
+                    g.hsGrab = x - th.left;
+                    SetCapture(hwnd);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                int over = MaxHOffset();
+                if (over > 0) {
+                    int step = std::max(1, FitWidth() - g.charW * 2);
+                    g.xOffset = std::clamp(x < th.left ? g.xOffset - step : g.xOffset + step, 0, over);
+                    UpdateScroll();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
                 return 0;
             }
 
-            if (y >= TextTop()) {
+            if (y >= g.clientH - g.statusH) {
+                int hit = StatusHitId(pt);
+                if (hit == 1) { OpenGoto(); return 0; }
+                if (hit == 2) { ShowEncodingMenu(pt); return 0; }
+                if (hit == 3) { ShowEolMenu(pt); return 0; }
+                return 0;
+            }
+
+            if (y >= TextTop() && y < TextBottom()) {
                 SetFocus(hwnd);
                 SetCapture(hwnd);
                 g.selecting = true;
@@ -3038,6 +3353,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_LBUTTONUP: {
+            if (g.hsDrag) {
+                g.hsDrag = false;
+                ReleaseCapture();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
             if (g.downBtn) {
                 g.downBtn = 0;
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -3058,6 +3378,52 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_MOUSEMOVE: {
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+            if (g.hsDrag) {
+                RECT tr = HScrollRect();
+                RECT th = HThumbRect();
+                int over = MaxHOffset();
+                if (tr.right > tr.left && over > 0 && th.right > th.left) {
+                    const int pad = MulDiv(6, g.dpi, 96);
+                    int trackL = tr.left + pad;
+                    int span = (tr.right - pad) - trackL;
+                    int tw = th.right - th.left;
+                    int maxT = std::max(1, span - tw);
+                    int t = std::clamp(x - g.hsGrab - trackL, 0, maxT);
+                    g.xOffset = (int)((long long)t * over / maxT);
+                    UpdateScroll();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+            // 横向滚动条悬停
+            RECT trh = HScrollRect();
+            POINT ph = { x, y };
+            bool overHs = trh.right > trh.left && PtInRect(&trh, ph) != 0;
+            if (overHs != g.hoverHs) {
+                g.hoverHs = overHs;
+                RECT hr = { 0, trh.top, g.clientW, trh.bottom };
+                InvalidateRect(hwnd, &hr, FALSE);
+            }
+            // 跳转栏悬停
+            if (g.gotoOpen && y >= g.toolbarH && y < TextTop()) {
+                GotoLayout gl = GotoRects();
+                int gb = 0;
+                if (PtInRect(&gl.close, ph)) gb = 4;
+                else if (PtInRect(&gl.go, ph)) gb = 8;
+                if (gb != g.hoverFindBtn) {
+                    g.hoverFindBtn = gb;
+                    RECT fr = { 0, g.toolbarH, g.clientW, TextTop() };
+                    InvalidateRect(hwnd, &fr, FALSE);
+                }
+            }
+            // 状态栏悬停
+            int st = 0;
+            if (y >= g.clientH - g.statusH) st = StatusHitId(ph);
+            if (st != g.hoverStatus) {
+                g.hoverStatus = st;
+                RECT sr = { 0, g.clientH - g.statusH, g.clientW, g.clientH };
+                InvalidateRect(hwnd, &sr, FALSE);
+            }
             // 查找栏悬停
             if (g.find.open && y >= g.toolbarH && y < TextTop()) {
                 POINT pt = { x, y };
@@ -3075,7 +3441,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     RECT fr = { 0, g.toolbarH, g.clientW, TextTop() };
                     InvalidateRect(hwnd, &fr, FALSE);
                 }
-            } else if (g.hoverFindBtn) {
+            } else if (g.hoverFindBtn && !g.gotoOpen) {
                 g.hoverFindBtn = 0;
                 RECT fr = { 0, g.toolbarH, g.clientW, g.toolbarH + g.findH };
                 InvalidateRect(hwnd, &fr, FALSE);
@@ -3086,7 +3452,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (y < g.toolbarH) {
                 RECT fn = FileNameRect();
                 POINT pt = { x, y };
-                overName = PtInRect(&fn, pt) != 0;
+                overName = fn.right > fn.left && PtInRect(&fn, pt) != 0;
                 h = overName ? 0 : HitButton(x, y);
             }
             if (h != g.hoverBtn || overName != g.hoverName) {
@@ -3133,7 +3499,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int steps = -(delta * (int)lines) / WHEEL_DELTA;
             if (steps == 0) steps = (delta > 0 ? -1 : 1);
             if (shift) {
-                g.xOffset = std::max(0, g.xOffset - steps * g.charW * 4);
+                g.xOffset = std::clamp(g.xOffset - steps * g.charW * 4, 0, MaxHOffset());
             } else {
                 int nt = std::clamp((int)g.topL + steps, 0, MaxTop());
                 g.topL = (size_t)nt;
