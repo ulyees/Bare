@@ -140,7 +140,7 @@ cl /nologo /O2 /MT /EHsc /std:c++17 /utf-8 Bare.cpp app_res.res ^
    user32.lib gdi32.lib comdlg32.lib dwmapi.lib shell32.lib advapi32.lib ole32.lib uuid.lib
 ```
 
-注意：源码必须定义 `NOMINMAX`，否则 `windows.h` 的 min/max 宏会与 `std::max`/`std::min` 冲突；源文件含中文字面量，必须加 `/utf-8`。另有 MinGW 备用脚本 `build.bat`；图标由 `make_icon.py` 生成 `app.ico`。
+注意：源码必须定义 `NOMINMAX`，否则 `windows.h` 的 min/max 宏会与 `std::max`/`std::min` 冲突；源文件含中文字面量，必须加 `/utf-8`。
 
 ## 目录结构
 
@@ -148,9 +148,7 @@ cl /nologo /O2 /MT /EHsc /std:c++17 /utf-8 Bare.cpp app_res.res ^
 Bare.cpp          # 全部源码（单文件，约 4900 行）
 Bare.exe          # 构建产物
 app.rc / app.ico / app.manifest
-build-msvc.bat    # 推荐构建脚本
-build.bat         # MinGW 构建脚本
-make_icon.py      # 生成图标
+build-msvc.bat    # 构建脚本
 docs/demo.txt     # 演示文本（上图内容）
 docs/screenshot.png / find.png / stream.png
 README.md
