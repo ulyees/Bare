@@ -10,6 +10,9 @@
 # 但保留可直接下载的免安装程序
 !Bare.exe
 
+# 本地配置（便携模式自动生成）
+Bare.ini
+
 # 系统杂项
 Thumbs.db
 desktop.ini

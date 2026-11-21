@@ -122,6 +122,7 @@ struct App {
     int maxLinePx = 0;
 
     int dpi = 96, fontPx = 16, lineH = 22, charW = 9;
+    std::wstring fontName = L"Consolas";            // 编辑器字体（可自选，写入配置）
     int gutterW = 56, toolbarH = 44, statusH = 26, findH = 40;
     int clientW = 0, clientH = 0;
 
@@ -192,16 +193,48 @@ static const wchar_t* kRegPath = L"Software\\Bare";
 static bool g_portable = false;                    // 便携模式：exe 同目录有 Bare.ini
 static std::wstring g_iniPath;
 
-// 便携模式检测：exe 同目录存在 Bare.ini 时配置写 ini，否则写注册表
+// 配置：默认用 exe 同目录的 Bare.ini（不存在则自动创建）；目录不可写时退回注册表
 static void InitConfig() {
     wchar_t exe[32768] = { 0 };
     if (!GetModuleFileNameW(nullptr, exe, 32768)) return;
     std::wstring p(exe);
     size_t sl = p.find_last_of(L"\\/");
     if (sl == std::wstring::npos) return;
-    g_iniPath = p.substr(0, sl) + L"\\Bare.ini";
-    if (GetFileAttributesW(g_iniPath.c_str()) != INVALID_FILE_ATTRIBUTES) g_portable = true;
-    else g_iniPath.clear();
+    std::wstring ini = p.substr(0, sl) + L"\\Bare.ini";
+    const bool existed = GetFileAttributesW(ini.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (!existed) {
+        static const char kDefaultIni[] =
+            "[Bare]\r\n"
+            "; Bare 配置文件：可直接编辑，删除后下次启动会重建\r\n"
+            "FontName=Consolas\r\n"
+            "FontPx=16\r\n"
+            "Wrap=1\r\n"
+            "ShowEol=1\r\n"
+            "ShowWs=0\r\n"
+            "TopMost=0\r\n"
+            "Max=0\r\n"
+            "ConfigVersion=1\r\n";
+        HANDLE hf = CreateFileW(ini.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf != INVALID_HANDLE_VALUE) {
+            DWORD wr = 0;
+            WriteFile(hf, kDefaultIni, (DWORD)(sizeof(kDefaultIni) - 1), &wr, nullptr);
+            CloseHandle(hf);
+        }
+    }
+    DWORD attr = GetFileAttributesW(ini.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_READONLY)) {
+        HANDLE ht = CreateFileW(ini.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (ht != INVALID_HANDLE_VALUE) {
+            CloseHandle(ht);
+            g_portable = true;
+            g_iniPath = ini;
+            return;
+        }
+    }
+    g_portable = false;
+    g_iniPath.clear();
 }
 
 // 前向声明
@@ -605,6 +638,8 @@ static void LoadSettings() {
     if (CfgGetDword(L"ShowEol", v)) g.showEol = v != 0;
     if (CfgGetDword(L"ShowWs", v))  g.showWs = v != 0;
     if (CfgGetDword(L"FontPx", v))  g.fontPx = (int)(v < 8 ? 8 : (v > 48 ? 48 : v));
+    std::wstring fn = CfgGetStr(L"FontName");
+    if (!fn.empty()) g.fontName = fn;
     LONG x = 0, yy = 0, w = 0, h = 0;
     bool hasX = CfgGetDword(L"WinX", v); if (hasX) x  = (LONG)v;
     bool hasY = CfgGetDword(L"WinY", v); if (hasY) yy = (LONG)v;
@@ -633,6 +668,7 @@ static void SaveSettings() {
     CfgPutDword(L"ShowEol", g.showEol ? 1 : 0);
     CfgPutDword(L"ShowWs", g.showWs ? 1 : 0);
     CfgPutDword(L"FontPx", (DWORD)(g.dpi ? MulDiv(g.fontPx, 96, g.dpi) : g.fontPx));
+    CfgPutStr(L"FontName", g.fontName);
     if (g.winRect.right > g.winRect.left && g.winRect.bottom > g.winRect.top) {
         CfgPutDword(L"WinX", (DWORD)(LONG)g.winRect.left);
         CfgPutDword(L"WinY", (DWORD)(LONG)g.winRect.top);
@@ -3721,9 +3757,10 @@ static void ToggleWrap() {
 
 static void MakeMonoFont() {
     if (g.hMono) DeleteObject(g.hMono);
+    const wchar_t* face = g.fontName.empty() ? L"Consolas" : g.fontName.c_str();
     g.hMono = CreateFontW(-g.fontPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                          CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+                          CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, face);
     HDC hdc = MeasureDC();
     SelectObject(hdc, g.hMono);
     SIZE sz = { 0, 0 };
@@ -3743,6 +3780,37 @@ static void ZoomFont(int dir) {
     EnsureCaretVisible();
     UpdateScroll();
     InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
+static void ChooseEditorFont() {
+    LOGFONTW lf = { 0 };
+    if (g.hMono) GetObjectW(g.hMono, sizeof(lf), &lf);
+    if (!lf.lfFaceName[0]) {
+        lf.lfHeight = -g.fontPx;
+        lf.lfWeight = FW_NORMAL;
+        lstrcpynW(lf.lfFaceName, L"Consolas", 32);
+    }
+    CHOOSEFONTW cf = { 0 };
+    cf.lStructSize = sizeof(cf);
+    cf.hwndOwner = g.hwnd;
+    cf.lpLogFont = &lf;
+    cf.Flags = CF_SCREENFONTS | CF_FIXEDPITCHONLY | CF_INITTOLOGFONTSTRUCT |
+               CF_FORCEFONTEXIST | CF_NOVERTFONTS | CF_LIMITSIZE | CF_NOSTYLESEL;
+    cf.nSizeMin = 8;
+    cf.nSizeMax = 40;
+    if (!ChooseFontW(&cf)) return;
+    std::wstring face = lf.lfFaceName;
+    if (!face.empty()) g.fontName = face;
+    if (cf.iPointSize > 0) {
+        int px = (int)((long long)cf.iPointSize * g.dpi / 720);
+        g.fontPx = std::clamp(px, MulDiv(8, g.dpi, 96), MulDiv(40, g.dpi, 96));
+    }
+    MakeMonoFont();
+    SaveSettings();
+    EnsureCaretVisible();
+    UpdateScroll();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+    Flash(L"字体已更新");
 }
 
 // -----------------------------------------------------------------------------
@@ -3894,7 +3962,9 @@ static void ShowContextMenu(POINT pt) {
     AppendMenuW(m, MF_STRING, 7, L"查找\tCtrl+F");
     AppendMenuW(m, MF_STRING, 8, L"查找并替换\tCtrl+H");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | (g.showWs ? MF_CHECKED : 0), 9, L"显示空白字符");
+    AppendMenuW(m, MF_STRING | (g.showWs ? MF_CHECKED : 0), 9, L"显示空白字符（空格 · / Tab →）");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 32, L"选择字体…");
     AppendMenuW(m, MF_STRING, 31, L"打印\tCtrl+P");
     int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                   sp.x, sp.y, 0, g.hwnd, nullptr);
@@ -3926,6 +3996,7 @@ static void ShowContextMenu(POINT pt) {
             Refresh();
             break;
         case 31: DoPrint(); break;
+        case 32: ChooseEditorFont(); break;
         default: break;
     }
 }
@@ -4621,6 +4692,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     bool needUninit = SUCCEEDED(hrCo);
 
     g.hinst = hInst;
+    InitConfig();
     LoadSettings();
 
     WNDCLASSEXW wc = { 0 };
