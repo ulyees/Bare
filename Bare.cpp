@@ -2611,7 +2611,7 @@ static FindLayout FindRects() {
     L.ww = { x - aw, y1, x, y1 + rh }; x -= aw + gap;
     L.rx = { x - aw, y1, x, y1 + rh }; x -= aw + gap;
     L.down = { x - rh, y1, x, y1 + rh }; x -= rh + gap;
-    L.up = { x - rh, y1, x, y1 + rh }; x -= rh + MulDiv(12, g.dpi, 96);
+    L.up = { x - rh, y1, x, y1 + rh }; x -= rh + MulDiv(88, g.dpi, 96);
     int fw = MulDiv(360, g.dpi, 96);
     int avail = x - pad;
     if (fw > avail) fw = std::max(0, avail);
@@ -3359,7 +3359,7 @@ static void DrawFindBar(HDC h) {
         }
     }
     RECT cr = { L.field.right + MulDiv(8, g.dpi, 96), L.field.top,
-                L.rx.left - MulDiv(6, g.dpi, 96), L.field.bottom };
+                L.up.left - MulDiv(6, g.dpi, 96), L.field.bottom };
     SetTextColor(h, g.cStatusText);
     DrawTextW(h, cnt.c_str(), -1, &cr,
               DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
