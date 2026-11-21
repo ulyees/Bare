@@ -1167,13 +1167,13 @@ static void LoadFile(const std::wstring& p, int forceKind, bool skipDiscard) {
     }
 
     // 超大文件：询问是否以只读快速模式打开
-    if (n > 256ULL * 1024 * 1024 && forceKind < 0) {
+    if (n > 256ULL * 1024 * 1024) {
         wchar_t q[600];
         swprintf(q, 600,
                  L"文件大小 %s，是否以只读快速模式打开？\n\n"
                  L"· 按需读取，几乎不占用内存\n"
-                 L"· 不能编辑、查找、替换\n"
-                 L"· 可以滚动、跳转、复制",
+                 L"· 不能编辑、替换（查找、跳转、复制正常）\n"
+                 L"· 保存 / 打印暂不可用",
                  FmtSize((unsigned long long)n).c_str());
         if (MessageBoxW(g.hwnd, q, L"Bare · 大文件", MB_YESNO | MB_ICONQUESTION) != IDYES) {
             if (hm) { UnmapViewOfFile(data); CloseHandle(hm); }
@@ -1857,6 +1857,19 @@ static const std::wstring& LineAt(size_t i) {
     return g.lines[k];
 }
 
+// 按绝对行号取行；流式模式下自动定位窗口并返回窗口内的行引用（引用仅窗口有效）
+static std::wstring& LineRef(size_t abs) {
+    if (!g.stream) {
+        if (g.lines.empty()) g.lines.emplace_back();
+        if (abs >= g.lines.size()) return g.lines.back();
+        return g.lines[abs];
+    }
+    LineAt(abs);
+    size_t idx = (abs >= g.streamBase) ? abs - g.streamBase : 0;
+    if (idx >= g.lines.size()) idx = g.lines.empty() ? 0 : g.lines.size() - 1;
+    return g.lines[idx];
+}
+
 static void CloseStream() {
     if (g.streamFile != INVALID_HANDLE_VALUE) {
         CloseHandle(g.streamFile);
@@ -2010,6 +2023,13 @@ static void EnsureCaretVisible() {
     if (g.curL < g.topL) g.topL = g.curL;
     HDC hdc = MeasureDC();
     int vis = VisLines();
+
+    // 流式大文件：直接校准 topL，避免跨越百万行做逐行布局
+    if (g.stream) {
+        const size_t v = (size_t)std::max(1, vis);
+        if (g.curL < g.topL) g.topL = g.curL;
+        if (g.curL - g.topL >= v) g.topL = (g.curL + 1 > v) ? g.curL + 1 - v : 0;
+    }
 
     // 计算光标行距顶部的可视行数
     int rows = 0;
@@ -2309,10 +2329,9 @@ static bool WordOk(const wchar_t* s, size_t n, size_t c, size_t len) {
     return true;
 }
 
-static void CollectLineHits(size_t line, std::vector<std::pair<size_t, size_t>>& out,
-                            const RxProg* prog) {
+static void CollectHitsIn(const std::wstring& ln, std::vector<std::pair<size_t, size_t>>& out,
+                          const RxProg* prog) {
     out.clear();
-    const std::wstring& ln = g.lines[line];
     const std::wstring& q = g.find.q;
     size_t vl = VLen(ln);
     if (q.empty() || vl == 0) return;
@@ -2346,12 +2365,12 @@ static void CollectLineHits(size_t line, std::vector<std::pair<size_t, size_t>>&
     }
 }
 
-static void RebuildFindHits() {
+// 流式大文件：顺序扫描全文收集命中（不建索引，按行解码；上限 10 万条）
+static void StreamFindHits() {
     FindState& F = g.find;
     F.hits.clear();
     F.current = -1;
     F.truncated = false;
-    F.dirtyHits = false;
     F.regexError = false;
     if (F.q.empty()) return;
     RxProg prog;
@@ -2361,9 +2380,87 @@ static void RebuildFindHits() {
         pp = &prog;
     }
     const size_t kCap = 100000;
+    const size_t kChunk = 4u << 20;
+    const bool wide = (g.streamEnc == 3 || g.streamEnc == 4);
+    HCURSOR wc = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    if (g.hwnd) { Flash(L"正在搜索…"); UpdateWindow(g.hwnd); }
+    std::vector<BYTE> buf, pending, chunk;
+    std::vector<std::pair<size_t, size_t>> lineHits;
+    size_t lineNo = 0;
+    bool stop = false;
+    auto emitLine = [&](const BYTE* s, size_t len) -> bool {
+        if (!wide && len > 0 && s[len - 1] == '\r') --len;
+        const std::wstring ln = StreamDecodeLine(s, len);
+        CollectHitsIn(ln, lineHits, pp);
+        for (size_t k = 0; k < lineHits.size(); ++k) {
+            FindHit h;
+            h.line = lineNo;
+            h.col = lineHits[k].first;
+            h.len = lineHits[k].second;
+            F.hits.push_back(h);
+            if (F.hits.size() >= kCap) { F.truncated = true; return false; }
+        }
+        ++lineNo;
+        return true;
+    };
+    size_t pos = g.streamSkip;
+    while (!stop && pos < g.streamBytes) {
+        size_t want = kChunk;
+        if (want > g.streamBytes - pos) want = (size_t)(g.streamBytes - pos);
+        if (!StreamReadAt(pos, want, buf) || buf.empty()) break;
+        pos += buf.size();
+        chunk.clear();
+        chunk.reserve(pending.size() + buf.size());
+        chunk.insert(chunk.end(), pending.begin(), pending.end());
+        chunk.insert(chunk.end(), buf.begin(), buf.end());
+        pending.clear();
+        size_t start = 0;
+        const size_t n = chunk.size();
+        for (size_t i = 0; i < n;) {
+            bool nl = false;
+            if (wide) {
+                if (i + 1 >= n) break;
+                unsigned short u = (g.streamEnc == 3)
+                    ? (unsigned short)(chunk[i] | ((unsigned short)chunk[i + 1] << 8))
+                    : (unsigned short)(chunk[i + 1] | ((unsigned short)chunk[i] << 8));
+                i += 2;
+                nl = (u == 0x000A);
+            } else {
+                nl = (chunk[i] == '\n');
+                ++i;
+            }
+            if (!nl) continue;
+            const size_t end = wide ? (i - 2) : (i - 1);
+            if (!emitLine(chunk.data() + start, end - start)) { stop = true; break; }
+            start = i;
+        }
+        if (stop) break;
+        if (start < chunk.size()) pending.assign(chunk.begin() + start, chunk.end());
+    }
+    if (!stop && !pending.empty()) emitLine(pending.data(), pending.size());
+    SetCursor(wc);
+    if (g.hwnd) InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
+static void RebuildFindHits() {
+    FindState& F = g.find;
+    F.hits.clear();
+    F.current = -1;
+    F.truncated = false;
+    F.dirtyHits = false;
+    F.regexError = false;
+    if (F.q.empty()) return;
+    if (g.stream) { StreamFindHits(); return; }
+    RxProg prog;
+    const RxProg* pp = nullptr;
+    if (F.regexMode) {
+        if (!RxCompile(F.q, prog) || prog.units.empty()) { F.regexError = true; return; }
+        pp = &prog;
+    }
+    const size_t kCap = 100000;
     std::vector<std::pair<size_t, size_t>> lineHits;
     for (size_t l = 0; l < g.lines.size(); ++l) {
-        CollectLineHits(l, lineHits, pp);
+        CollectHitsIn(g.lines[l], lineHits, pp);
         for (size_t k = 0; k < lineHits.size(); ++k) {
             FindHit h;
             h.line = l;
@@ -2431,7 +2528,8 @@ static void OnFindChanged() {
     g.find.dirtyHits = true;
     g.find.current = -1;
     g.find.truncated = false;
-    if (g.hwnd) SetTimer(g.hwnd, 2, 90, nullptr);
+    // 大文件流式模式：逐字扫描太贵，改为按 Enter / F3 时才全文搜索
+    if (g.hwnd && !g.stream) SetTimer(g.hwnd, 2, 90, nullptr);
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
@@ -2443,7 +2541,7 @@ static void SyncFindHeight() {
 }
 
 static void OpenFind(bool replaceMode) {
-    if (g.stream) { Flash(L"只读快速模式不支持查找"); return; }
+    if (g.stream) replaceMode = false;   // 大文件只读模式：只查找，不替换
     bool was = g.find.open;
     if (g.gotoOpen) { g.gotoOpen = false; g.gotoText.clear(); }
     g.find.open = true;
@@ -2574,6 +2672,7 @@ static void ReplaceAll() {
 
 // 打印（Ctrl+P / 右键菜单）
 static void DoPrint() {
+    if (g.stream) { Flash(L"只读快速模式暂不支持打印"); return; }
     PRINTDLGW pd = { 0 };
     pd.lStructSize = sizeof(pd);
     pd.hwndOwner = g.hwnd;
@@ -2931,10 +3030,20 @@ static void CopySel(bool cut) {
     if (!HasSelection()) return;
     size_t l1, c1, l2, c2;
     GetSel(l1, c1, l2, c2);
+    if (g.stream) {
+        size_t wEnd = g.streamBase + (g.lines.empty() ? 1 : g.lines.size()) - 1;
+        if (l1 < g.streamBase || l2 > wEnd) {
+            Flash(L"大文件模式：请只选择当前窗口内的内容再复制");
+            return;
+        }
+    }
     std::wstring out;
     for (size_t i = l1; i <= l2; ++i) {
-        size_t a = (i == l1 ? c1 : 0), b = (i == l2 ? c2 : VLen(g.lines[i]));
-        out.append(g.lines[i].data() + a, b - a);
+        const std::wstring& ln = LineRef(i);
+        size_t a = (i == l1 ? c1 : 0), b = (i == l2 ? c2 : VLen(ln));
+        if (b > ln.size()) b = ln.size();
+        if (a > b) a = b;
+        out.append(ln.data() + a, b - a);
         if (i < l2) out += L"\r\n";
     }
     if (OpenClipboard(g.hwnd)) {
@@ -2976,6 +3085,7 @@ static void Paste() {
 }
 
 static void SelectAll() {
+    if (g.stream) { Flash(L"大文件只读模式：请用鼠标选择要复制的内容"); return; }
     g.anchorL = 0; g.anchorC = 0;
     g.curL = g.lines.size() - 1;
     g.curC = VLen(g.lines[g.curL]);
@@ -2985,20 +3095,20 @@ static void SelectAll() {
 
 static void MoveHoriz(int dir, bool ext) {
     if (ext && !g.hasSel) { g.anchorL = g.curL; g.anchorC = g.curC; }
-    std::wstring& L = g.lines[g.curL];
+    const std::wstring& L = LineRef(g.curL);
     size_t vl = VLen(L);
     if (dir < 0) {
         if (g.curC > 0) {
             --g.curC;
             if (g.curC > 0 && IsLow(L[g.curC]) && IsHigh(L[g.curC - 1])) --g.curC;
         } else if (g.curL > 0) {
-            --g.curL; g.curC = VLen(g.lines[g.curL]);
+            --g.curL; g.curC = VLen(LineRef(g.curL));
         }
     } else {
         if (g.curC < vl) {
             ++g.curC;
             if (g.curC < vl && IsLow(L[g.curC]) && IsHigh(L[g.curC - 1])) ++g.curC;
-        } else if (g.curL + 1 < g.lines.size()) {
+        } else if (g.curL + 1 < DocLines()) {
             ++g.curL; g.curC = 0;
         }
     }
@@ -3385,7 +3495,7 @@ static void DrawFindBar(HDC h) {
     // 命中计数
     std::wstring cnt;
     if (!g.find.q.empty()) {
-        if (g.find.dirtyHits) cnt = L"…";
+        if (g.find.dirtyHits) cnt = g.stream ? L"Enter 搜索" : L"…";
         else if (g.find.regexMode && g.find.regexError) cnt = L"正则有误";
         else if (g.find.hits.empty()) cnt = L"无结果";
         else {
@@ -3526,7 +3636,7 @@ static void Paint(HWND hwnd) {
         if (!g.wrap && !dx.empty() && dx.back() > g.maxLinePx) g.maxLinePx = dx.back();
 
         // 本行所有查找命中
-        if (findOn) CollectLineHits(i, fmatch, paPP);
+        if (findOn) CollectHitsIn(LineAt(i), fmatch, paPP);
 
         for (size_t k = 0; k < br.size(); ++k) {
             if (y >= textBottom) break;
@@ -4166,7 +4276,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             } else if (wp == 2) {
                 KillTimer(hwnd, 2);
-                if (g.find.open && g.find.dirtyHits) FindNav(true);
+                if (g.find.open && g.find.dirtyHits && !g.stream) FindNav(true);
             } else if (wp == 3) {
                 CheckExternalChange();
             } else if (wp == 5) {
