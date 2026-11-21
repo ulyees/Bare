@@ -52,6 +52,12 @@ struct Enc {
 // -----------------------------------------------------------------------------
 // 查找 / 替换状态
 // -----------------------------------------------------------------------------
+struct FindHit {
+    size_t line = 0;
+    size_t col = 0;
+    size_t len = 0;
+};
+
 struct FindState {
     bool open = false;
     bool replaceMode = false;                     // 是否显示替换行
@@ -60,10 +66,13 @@ struct FindState {
     std::wstring rep;                             // 替换串
     bool caseSensitive = false;                   // 区分大小写
     bool fromStart = false;                       // 每次从文档开头查找
-    std::vector<std::pair<size_t, size_t>> hits;  // (行, 起始列)
+    bool wholeWord = false;                       // 全字匹配
+    bool regexMode = false;                       // 正则模式
+    std::vector<FindHit> hits;                    // (行, 起始列, 长度)
     int current = -1;
     bool dirtyHits = true;
     bool truncated = false;
+    bool regexError = false;                      // 正则表达式语法错误
 };
 
 // -----------------------------------------------------------------------------
@@ -126,8 +135,30 @@ struct App {
     int hoverBtn = 0, downBtn = 0;                 // 1打开 2保存 3另存为 4置顶 5换行
     bool hoverName = false;
     bool hoverFind = false;
-    int hoverFindBtn = 0;                          // 查找栏：1上 2下 3Aa 4关闭 5替换 6全部 7从头
+    int hoverFindBtn = 0;                          // 查找栏：1上 2下 3Aa 4关闭 5替换 6全部 7从头 9.* 10ab
     FindState find;
+
+    bool readOnly = false;                         // 只读模式（只读属性 / 被占用 / 流式大文件）
+    std::wstring readOnlyWhy;                      // 只读原因提示
+    bool showWs = false;                           // 显示空格 · 与 Tab →
+
+    // 大文件只读流式模式（不建逐行索引，窗口级滚动）
+    bool stream = false;
+    HANDLE streamFile = INVALID_HANDLE_VALUE;
+    unsigned long long streamBytes = 0;
+    size_t streamLines = 0;
+    size_t streamBase = 0;                         // g.lines[0] 的绝对行号
+    std::vector<unsigned long long> streamIdx;     // 每 kStreamBlock 行的字节偏移
+    int streamEnc = 0;                             // 0 UTF8 / 1 ANSI / 2 BYTES / 3 UTF16LE / 4 UTF16BE
+    size_t streamSkip = 0;                         // BOM 跳过字节数
+
+    // 最近打开 / 上次目录
+    std::vector<std::wstring> mru;
+    std::wstring lastDir;
+
+    // 崩溃恢复
+    int editsSinceSnap = 0;
+    unsigned long long lastSnapTick = 0;
 
     bool hasFocus = true, caretOn = true;
     bool dark = false;
@@ -158,6 +189,20 @@ struct App {
 static App g;
 
 static const wchar_t* kRegPath = L"Software\\Bare";
+static bool g_portable = false;                    // 便携模式：exe 同目录有 Bare.ini
+static std::wstring g_iniPath;
+
+// 便携模式检测：exe 同目录存在 Bare.ini 时配置写 ini，否则写注册表
+static void InitConfig() {
+    wchar_t exe[32768] = { 0 };
+    if (!GetModuleFileNameW(nullptr, exe, 32768)) return;
+    std::wstring p(exe);
+    size_t sl = p.find_last_of(L"\\/");
+    if (sl == std::wstring::npos) return;
+    g_iniPath = p.substr(0, sl) + L"\\Bare.ini";
+    if (GetFileAttributesW(g_iniPath.c_str()) != INVALID_FILE_ATTRIBUTES) g_portable = true;
+    else g_iniPath.clear();
+}
 
 // 前向声明
 static void UpdateTitle();
@@ -180,6 +225,15 @@ static void LoadSettings();
 static void SaveSettings();
 static bool ShouldOpenNewWindow();
 static void LaunchNewWindow(const std::wstring& p);
+static void DoPrint();
+static void DeleteRecoverySnapshot();
+static std::wstring RecFileFor(const std::wstring& path);
+static bool EditAllowed();
+static void CloseStream();
+static size_t DocLines();
+static const std::wstring& LineAt(size_t i);
+static void StreamCountLines();
+static void StreamWindow(size_t top, size_t vis);
 
 // -----------------------------------------------------------------------------
 // 小工具
@@ -460,44 +514,139 @@ static void RegPut(HKEY k, const wchar_t* n, DWORD v) {
     RegSetValueExW(k, n, 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
 }
 
-static void LoadSettings() {
-    HKEY k = nullptr;
-    g.winRect = RECT{ 0, 0, 0, 0 };
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegPath, 0, KEY_READ, &k) != ERROR_SUCCESS) return;
-    DWORD v = 0;
-    if (RegDword(k, L"Wrap", v))    g.wrap = v != 0;
-    if (RegDword(k, L"TopMost", v)) g.topmost = v != 0;
-    if (RegDword(k, L"ShowEol", v)) g.showEol = v != 0;
-    if (RegDword(k, L"FontPx", v))  g.fontPx = (int)(v < 8 ? 8 : (v > 48 ? 48 : v));
-    LONG x = 0, yy = 0, w = 0, h = 0;
-    DWORD sz = sizeof(DWORD), type = 0;
-    if (RegQueryValueExW(k, L"WinX", nullptr, &type, (LPBYTE)&x, &sz) == ERROR_SUCCESS &&
-        RegQueryValueExW(k, L"WinY", nullptr, &type, (LPBYTE)&yy, &sz) == ERROR_SUCCESS &&
-        RegQueryValueExW(k, L"WinW", nullptr, &type, (LPBYTE)&w, &sz) == ERROR_SUCCESS &&
-        RegQueryValueExW(k, L"WinH", nullptr, &type, (LPBYTE)&h, &sz) == ERROR_SUCCESS &&
-        w > 200 && h > 150) {
-        g.winRect = RECT{ (LONG)x, (LONG)yy, (LONG)x + (LONG)w, (LONG)yy + (LONG)h };
+static std::wstring CfgGetStr(const wchar_t* name) {
+    if (g_portable) {
+        wchar_t buf[16384] = { 0 };
+        GetPrivateProfileStringW(L"Bare", name, L"", buf, 16384, g_iniPath.c_str());
+        return buf;
     }
-    if (RegDword(k, L"Max", v)) g.winMax = v != 0;
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegPath, 0, KEY_READ, &k) != ERROR_SUCCESS)
+        return std::wstring();
+    DWORD sz = 0, type = 0;
+    std::wstring out;
+    if (RegQueryValueExW(k, name, nullptr, &type, nullptr, &sz) == ERROR_SUCCESS &&
+        (type == REG_SZ || type == REG_EXPAND_SZ) && sz >= 2) {
+        std::vector<wchar_t> buf(sz / sizeof(wchar_t) + 2, 0);
+        if (RegQueryValueExW(k, name, nullptr, &type, (LPBYTE)buf.data(), &sz) == ERROR_SUCCESS)
+            out.assign(buf.data());
+    }
     RegCloseKey(k);
+    return out;
 }
 
-static void SaveSettings() {
+static void CfgPutStr(const wchar_t* name, const std::wstring& s) {
+    if (g_portable) {
+        WritePrivateProfileStringW(L"Bare", name, s.c_str(), g_iniPath.c_str());
+        return;
+    }
     HKEY k = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegPath, 0, nullptr, 0, KEY_WRITE,
                         nullptr, &k, nullptr) != ERROR_SUCCESS) return;
-    RegPut(k, L"Wrap", g.wrap ? 1 : 0);
-    RegPut(k, L"TopMost", g.topmost ? 1 : 0);
-    RegPut(k, L"ShowEol", g.showEol ? 1 : 0);
-    RegPut(k, L"FontPx", (DWORD)(g.dpi ? MulDiv(g.fontPx, 96, g.dpi) : g.fontPx));
-    if (g.winRect.right > g.winRect.left && g.winRect.bottom > g.winRect.top) {
-        RegPut(k, L"WinX", (DWORD)(LONG)g.winRect.left);
-        RegPut(k, L"WinY", (DWORD)(LONG)g.winRect.top);
-        RegPut(k, L"WinW", (DWORD)(LONG)(g.winRect.right - g.winRect.left));
-        RegPut(k, L"WinH", (DWORD)(LONG)(g.winRect.bottom - g.winRect.top));
-    }
-    RegPut(k, L"Max", g.winMax ? 1 : 0);
+    RegSetValueExW(k, name, 0, REG_SZ, (const BYTE*)s.c_str(),
+                   (DWORD)((s.size() + 1) * sizeof(wchar_t)));
     RegCloseKey(k);
+}
+
+static bool CfgGetDword(const wchar_t* name, DWORD& out) {
+    out = 0;
+    if (g_portable) {
+        UINT v = GetPrivateProfileIntW(L"Bare", name, 0xFFFFFFFFu, g_iniPath.c_str());
+        if (v == 0xFFFFFFFFu) return false;
+        out = v;
+        return true;
+    }
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegPath, 0, KEY_READ, &k) != ERROR_SUCCESS) return false;
+    bool ok = RegDword(k, name, out);
+    RegCloseKey(k);
+    return ok;
+}
+
+static void CfgPutDword(const wchar_t* name, DWORD v) {
+    wchar_t b[32];
+    swprintf(b, 32, L"%lu", (unsigned long)v);
+    CfgPutStr(name, b);
+}
+
+// 最近打开列表
+static void SaveMru() {
+    std::wstring m;
+    for (size_t i = 0; i < g.mru.size(); ++i) {
+        if (i) m += L'\n';
+        m += g.mru[i];
+    }
+    CfgPutStr(L"MRU", m);
+}
+
+static void AddMru(const std::wstring& p) {
+    if (p.empty()) return;
+    for (size_t i = 0; i < g.mru.size();) {
+        if (_wcsicmp(g.mru[i].c_str(), p.c_str()) == 0) g.mru.erase(g.mru.begin() + i);
+        else ++i;
+    }
+    g.mru.insert(g.mru.begin(), p);
+    if (g.mru.size() > 10) g.mru.resize(10);
+    SaveMru();
+}
+
+static void SaveLastDir(const std::wstring& file) {
+    std::wstring d = DirName(file);
+    if (d.empty() || d == g.lastDir) return;
+    g.lastDir = d;
+    CfgPutStr(L"LastDir", d);
+}
+
+static void LoadSettings() {
+    g.winRect = RECT{ 0, 0, 0, 0 };
+    DWORD v = 0;
+    if (CfgGetDword(L"Wrap", v))    g.wrap = v != 0;
+    if (CfgGetDword(L"TopMost", v)) g.topmost = v != 0;
+    if (CfgGetDword(L"ShowEol", v)) g.showEol = v != 0;
+    if (CfgGetDword(L"ShowWs", v))  g.showWs = v != 0;
+    if (CfgGetDword(L"FontPx", v))  g.fontPx = (int)(v < 8 ? 8 : (v > 48 ? 48 : v));
+    LONG x = 0, yy = 0, w = 0, h = 0;
+    bool hasX = CfgGetDword(L"WinX", v); if (hasX) x  = (LONG)v;
+    bool hasY = CfgGetDword(L"WinY", v); if (hasY) yy = (LONG)v;
+    bool hasW = CfgGetDword(L"WinW", v); if (hasW) w  = (LONG)v;
+    bool hasH = CfgGetDword(L"WinH", v); if (hasH) h  = (LONG)v;
+    if (hasX && hasY && hasW && hasH && w > 200 && h > 150)
+        g.winRect = RECT{ x, yy, x + w, yy + h };
+    if (CfgGetDword(L"Max", v)) g.winMax = v != 0;
+
+    g.mru.clear();
+    std::wstring m = CfgGetStr(L"MRU");
+    size_t st = 0;
+    while (st <= m.size() && g.mru.size() < 10) {
+        size_t e = m.find(L'\n', st);
+        std::wstring one = m.substr(st, e == std::wstring::npos ? std::wstring::npos : e - st);
+        if (!one.empty()) g.mru.push_back(one);
+        if (e == std::wstring::npos) break;
+        st = e + 1;
+    }
+    g.lastDir = CfgGetStr(L"LastDir");
+}
+
+static void SaveSettings() {
+    CfgPutDword(L"Wrap", g.wrap ? 1 : 0);
+    CfgPutDword(L"TopMost", g.topmost ? 1 : 0);
+    CfgPutDword(L"ShowEol", g.showEol ? 1 : 0);
+    CfgPutDword(L"ShowWs", g.showWs ? 1 : 0);
+    CfgPutDword(L"FontPx", (DWORD)(g.dpi ? MulDiv(g.fontPx, 96, g.dpi) : g.fontPx));
+    if (g.winRect.right > g.winRect.left && g.winRect.bottom > g.winRect.top) {
+        CfgPutDword(L"WinX", (DWORD)(LONG)g.winRect.left);
+        CfgPutDword(L"WinY", (DWORD)(LONG)g.winRect.top);
+        CfgPutDword(L"WinW", (DWORD)(LONG)(g.winRect.right - g.winRect.left));
+        CfgPutDword(L"WinH", (DWORD)(LONG)(g.winRect.bottom - g.winRect.top));
+    }
+    CfgPutDword(L"Max", g.winMax ? 1 : 0);
+    std::wstring m;
+    for (size_t i = 0; i < g.mru.size(); ++i) {
+        if (i) m += L'\n';
+        m += g.mru[i];
+    }
+    CfgPutStr(L"MRU", m);
+    CfgPutStr(L"LastDir", g.lastDir);
 }
 
 // -----------------------------------------------------------------------------
@@ -521,6 +670,56 @@ static HANDLE OpenRead(const std::wstring& p) {
                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                        nullptr, OPEN_EXISTING,
                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+}
+
+// 打开文件并检测锁：文件被写占用或本身只读时返回只读标志
+static HANDLE OpenReadEx(const std::wstring& p, bool& readOnly, std::wstring& why) {
+    readOnly = false;
+    std::wstring e = ExtPath(p);
+    DWORD attr = GetFileAttributesW(e.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_READONLY)) {
+        readOnly = true;
+        why = L"文件带有只读属性";
+    }
+    HANDLE h = CreateFileW(e.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        if (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION) {
+            readOnly = true;
+            why = L"文件正被其他程序占用";
+            h = CreateFileW(e.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        }
+    }
+    return h;
+}
+
+// 把 Win32 错误码翻译成可执行的建议
+static std::wstring FileErrorText(DWORD code, const std::wstring& target) {
+    std::wstring name = target.empty() ? std::wstring(L"文件") : FileName(target);
+    switch (code) {
+        case ERROR_DISK_FULL:
+        case ERROR_HANDLE_DISK_FULL:
+            return L"磁盘空间不足，无法写入「" + name + L"」。\n\n建议：清理磁盘空间，或另存到其他磁盘。";
+        case ERROR_ACCESS_DENIED:
+            return L"没有写入「" + name + L"」的权限。\n\n建议：以管理员身份运行 Bare，或另存到其他位置（例如桌面或文档）。";
+        case ERROR_SHARING_VIOLATION:
+        case ERROR_LOCK_VIOLATION:
+            return L"「" + name + L"」正被其他程序占用，无法写入。\n\n建议：关闭占用该文件的程序后重试，或另存为新文件。";
+        case ERROR_WRITE_PROTECT:
+            return L"目标位置处于写保护状态（只读介质或只读共享）。\n\n建议：另存到本地磁盘。";
+        case ERROR_PATH_NOT_FOUND:
+        case ERROR_FILE_NOT_FOUND:
+            return L"路径不存在：\n" + target + L"\n\n建议：检查目录是否被移动或删除，然后另存为。";
+        case ERROR_FILENAME_EXCED_RANGE:
+            return L"路径过长，系统无法写入。\n\n建议：缩短文件名或减少目录层级。";
+        default:
+            return L"无法写入「" + name + L"」（错误码 " + std::to_wstring((unsigned long long)code) +
+                   L"）。\n\n建议：检查磁盘状态与文件权限后重试；仍失败可另存为新文件。";
+    }
 }
 
 static bool GetStamp(const std::wstring& p, FILETIME& ft, unsigned long long& size) {
@@ -600,11 +799,11 @@ static void PosAfter(size_t l, size_t c, const std::wstring& t, size_t& ol, size
 static std::wstring RangeText(size_t l1, size_t c1, size_t l2, size_t c2) {
     if (l1 > l2 || (l1 == l2 && c1 >= c2)) return std::wstring();
     std::wstring out;
-    out.append(g.lines[l1], c1, std::wstring::npos);
+    out.append(LineAt(l1), c1, std::wstring::npos);
     for (size_t i = l1 + 1; i <= l2; ++i) {
         out += L'\n';
-        if (i == l2) out.append(g.lines[i].data(), c2);
-        else out += g.lines[i];
+        if (i == l2) out.append(LineAt(i).data(), c2);
+        else out += LineAt(i);
     }
     return out;
 }
@@ -688,6 +887,7 @@ static void EditRange(size_t l1, size_t c1, size_t l2, size_t c2,
 }
 
 static void UndoRedo(bool redo) {
+    if (!EditAllowed()) return;
     std::vector<UndoRec>& src = redo ? g.redo : g.undo;
     if (src.empty()) return;
     UndoRec r = std::move(src.back());
@@ -739,11 +939,10 @@ static bool PickOpen(std::wstring& out) {
             { L"文本文件 (*.txt)", L"*.txt" },
         };
         dlg->SetFileTypes(2, types);
-        if (!g.path.empty()) {
+        std::wstring openDir = !g.path.empty() ? DirName(g.path) : g.lastDir;
+        if (!openDir.empty()) {
             IShellItem* folder = nullptr;
-            std::wstring dir = DirName(g.path);
-            if (!dir.empty() &&
-                SUCCEEDED(SHCreateItemFromParsingName(dir.c_str(), nullptr,
+            if (SUCCEEDED(SHCreateItemFromParsingName(openDir.c_str(), nullptr,
                                                       IID_PPV_ARGS(&folder))) && folder) {
                 dlg->SetFolder(folder);
                 folder->Release();
@@ -792,11 +991,10 @@ static bool PickSave(const std::wstring& suggest, std::wstring& out) {
         dlg->SetFileTypes(2, types);
         dlg->SetDefaultExtension(L"txt");
         if (!suggest.empty()) dlg->SetFileName(suggest.c_str());
-        if (!g.path.empty()) {
+        std::wstring saveDir = !g.path.empty() ? DirName(g.path) : g.lastDir;
+        if (!saveDir.empty()) {
             IShellItem* folder = nullptr;
-            std::wstring dir = DirName(g.path);
-            if (!dir.empty() &&
-                SUCCEEDED(SHCreateItemFromParsingName(dir.c_str(), nullptr,
+            if (SUCCEEDED(SHCreateItemFromParsingName(saveDir.c_str(), nullptr,
                                                       IID_PPV_ARGS(&folder))) && folder) {
                 dlg->SetFolder(folder);
                 folder->Release();
@@ -880,10 +1078,15 @@ static void ReloadWithEncoding(int forceKind);
 
 static void LoadFile(const std::wstring& p, int forceKind, bool skipDiscard) {
     if (!skipDiscard && !ConfirmDiscard()) return;
+    if (!skipDiscard) DeleteRecoverySnapshot();
+    CloseStream();
 
-    HANDLE hf = OpenRead(p);
+    bool ro = false;
+    std::wstring roWhy;
+    HANDLE hf = OpenReadEx(p, ro, roWhy);
     if (hf == INVALID_HANDLE_VALUE) {
-        MessageBoxW(g.hwnd, L"无法打开该文件。", L"Bare", MB_OK | MB_ICONWARNING);
+        DWORD le = GetLastError();
+        MessageBoxW(g.hwnd, FileErrorText(le, p).c_str(), L"Bare · 无法打开", MB_OK | MB_ICONWARNING);
         return;
     }
     LARGE_INTEGER li = { { 0, 0 } };
@@ -927,6 +1130,63 @@ static void LoadFile(const std::wstring& p, int forceKind, bool skipDiscard) {
         else if (forceKind == Enc::UTF16BE && n >= 2 && data && data[0] == 0xFE && data[1] == 0xFF) e.skip = 2;
     }
 
+    // 超大文件：询问是否以只读快速模式打开
+    if (n > 256ULL * 1024 * 1024 && forceKind < 0) {
+        wchar_t q[600];
+        swprintf(q, 600,
+                 L"文件大小 %s，是否以只读快速模式打开？\n\n"
+                 L"· 按需读取，几乎不占用内存\n"
+                 L"· 不能编辑、查找、替换\n"
+                 L"· 可以滚动、跳转、复制",
+                 FmtSize((unsigned long long)n).c_str());
+        if (MessageBoxW(g.hwnd, q, L"Bare · 大文件", MB_YESNO | MB_ICONQUESTION) != IDYES) {
+            if (hm) { UnmapViewOfFile(data); CloseHandle(hm); }
+            CloseHandle(hf);
+            return;
+        }
+        g.stream = true;
+        g.streamFile = hf;
+        g.streamBytes = n;
+        g.streamSkip = e.skip;
+        g.streamEnc = (e.kind == Enc::UTF16LE) ? 3
+                    : (e.kind == Enc::UTF16BE) ? 4
+                    : (e.kind == Enc::ANSI) ? 1
+                    : (e.kind == Enc::BYTES) ? 2 : 0;
+        if (data) UnmapViewOfFile(data);
+        if (hm) CloseHandle(hm);
+        data = nullptr;
+        hm = nullptr;
+        StreamCountLines();
+        g.lines.clear();
+        StreamWindow(0, 60);
+        g.path = p;
+        AddMru(p);
+        SaveLastDir(p);
+        g.readOnly = true;
+        g.readOnlyWhy = L"大文件只读快速模式";
+        g.enc = e;
+        g.fileSize = li.QuadPart;
+        g.dirty = false;
+        g.curL = g.curC = 0;
+        g.hasSel = false;
+        g.selecting = false;
+        g.pendingHigh = 0;
+        g.desiredX = -1;
+        g.topL = 0;
+        g.xOffset = 0;
+        g.maxLinePx = 0;
+        g.undo.clear();
+        g.redo.clear();
+        g.savedDepth = 0;
+        ResetFind();
+        UpdateStamp();
+        UpdateTitle();
+        UpdateScroll();
+        Refresh();
+        Flash(L"只读快速模式（大文件）");
+        return;
+    }
+
     size_t hint = 1;
     if (data && n > e.skip) {
         if (e.kind == Enc::UTF8 || e.kind == Enc::ANSI || e.kind == Enc::BYTES) {
@@ -952,6 +1212,14 @@ static void LoadFile(const std::wstring& p, int forceKind, bool skipDiscard) {
     SetCursor(oldCur);
 
     g.path = p;
+    AddMru(p);
+    SaveLastDir(p);
+    g.readOnly = ro;
+    g.readOnlyWhy = roWhy;
+    if (ro) {
+        std::wstring m = L"只读：" + roWhy;
+        Flash(m.c_str());
+    }
     g.enc = e;
     g.fileSize = li.QuadPart;
     g.dirty = false;
@@ -998,10 +1266,17 @@ static bool WriteDocumentTo(const std::wstring& target, bool withBackup, std::ws
     HANDLE hf = CreateFileW(ExtPath(tmp).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (hf == INVALID_HANDLE_VALUE) {
-        err = L"无法写入文件：路径不可写或文件被占用。";
+        err = FileErrorText(GetLastError(), target);
         return false;
     }
     Writer w(hf);
+    if (!w.ok) {
+        DWORD le = GetLastError();
+        CloseHandle(hf);
+        DeleteFileW(ExtPath(tmp).c_str());
+        err = FileErrorText(le, target);
+        return false;
+    }
     WriteBOM(w, g.enc);
     const std::wstring nl = L"\n";
     for (size_t i = 0; i < g.lines.size() && w.ok; ++i) {
@@ -1012,8 +1287,9 @@ static bool WriteDocumentTo(const std::wstring& target, bool withBackup, std::ws
     FlushFileBuffers(hf);
     CloseHandle(hf);
     if (!w.ok) {
+        DWORD le = GetLastError();
         DeleteFileW(ExtPath(tmp).c_str());
-        err = L"写入文件时发生错误。";
+        err = FileErrorText(le, target);
         return false;
     }
 
@@ -1034,14 +1310,23 @@ static bool WriteDocumentTo(const std::wstring& target, bool withBackup, std::ws
         ok = MoveFileExW(tp.c_str(), t.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
     }
     if (!ok) {
+        DWORD le = GetLastError();
         DeleteFileW(tp.c_str());
-        err = L"替换原文件失败（可能被其他程序占用）。";
+        err = L"无法替换原文件。\n\n" + FileErrorText(le, target);
         return false;
     }
     return true;
 }
 
 static void SaveFile(bool saveAs) {
+    if (g.stream) { Flash(L"只读快速模式：不能保存"); return; }
+    std::wstring oldPath = g.path;
+    if (g.readOnly && !saveAs && !g.path.empty()) {
+        std::wstring m = L"当前文件为只读（" + g.readOnlyWhy + L"）。\n\n是否另存为新的文件？";
+        if (MessageBoxW(g.hwnd, m.c_str(), L"Bare · 只读", MB_YESNO | MB_ICONINFORMATION) != IDYES)
+            return;
+        saveAs = true;
+    }
     if (saveAs || g.path.empty()) {
         if (!AskSavePath()) return;
     }
@@ -1062,6 +1347,12 @@ static void SaveFile(bool saveAs) {
         MessageBoxW(g.hwnd, err.c_str(), L"Bare", MB_OK | MB_ICONWARNING);
         return;
     }
+    if (oldPath != g.path) {
+        std::wstring of = RecFileFor(oldPath);
+        if (!of.empty()) DeleteFileW(ExtPath(of).c_str());
+    }
+    DeleteRecoverySnapshot();
+    if (saveAs) { g.readOnly = false; g.readOnlyWhy.clear(); }
     UpdateStamp();
     g.savedDepth = g.undo.size();
     g.redo.clear();
@@ -1088,6 +1379,8 @@ static bool ConfirmDiscard() {
 
 static void NewFile() {
     if (!ConfirmDiscard()) return;
+    DeleteRecoverySnapshot();
+    CloseStream();
     g.path.clear();
     g.enc = Enc();
     g.dirty = false;
@@ -1113,6 +1406,204 @@ static void NewFile() {
     UpdateTitle();
     UpdateScroll();
     Refresh();
+}
+
+// -----------------------------------------------------------------------------
+// 崩溃恢复快照（%LOCALAPPDATA%\\Bare\\recovery）
+// -----------------------------------------------------------------------------
+static std::wstring RecoveryDir() {
+    wchar_t base[32768] = { 0 };
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, 32768);
+    std::wstring dir;
+    if (n > 0 && n < 32768) dir.assign(base, n);
+    if (dir.empty()) {
+        wchar_t tmp[32768] = { 0 };
+        DWORD m = GetTempPathW(32768, tmp);
+        if (m > 0 && m < 32768) dir.assign(tmp, m);
+    }
+    if (dir.empty()) return std::wstring();
+    while (!dir.empty() && (dir.back() == L'\\' || dir.back() == L'/')) dir.pop_back();
+    return dir + L"\\Bare\\recovery";
+}
+
+static void EnsureDir(const std::wstring& d) {
+    if (d.empty()) return;
+    std::wstring cur;
+    for (size_t i = 0; i < d.size(); ++i) {
+        cur.push_back(d[i]);
+        if (d[i] == L'\\' || d[i] == L'/') {
+            if (i == 2 && d.size() > 2 && d[1] == L':') continue;
+            CreateDirectoryW(cur.c_str(), nullptr);
+        }
+    }
+    CreateDirectoryW(cur.c_str(), nullptr);
+}
+
+static std::wstring RecKeyFor(const std::wstring& path) {
+    std::wstring s = path.empty() ? std::wstring(L"untitled") : path;
+    unsigned int h = 2166136261u;
+    for (wchar_t c : s) {
+        wchar_t lc = (c >= L'A' && c <= L'Z') ? (wchar_t)(c - L'A' + L'a') : c;
+        h ^= (unsigned int)lc;
+        h *= 16777619u;
+    }
+    wchar_t b[16];
+    swprintf(b, 16, L"%08x", h);
+    return b;
+}
+
+static std::wstring RecFileFor(const std::wstring& path) {
+    std::wstring d = RecoveryDir();
+    if (d.empty()) return std::wstring();
+    return d + L"\\" + RecKeyFor(path) + L".rec";
+}
+
+static void DeleteRecoverySnapshot() {
+    std::wstring f = RecFileFor(g.path);
+    if (!f.empty()) DeleteFileW(ExtPath(f).c_str());
+}
+
+static bool ReadFileBytes(const std::wstring& p, std::string& out) {
+    out.clear();
+    HANDLE h = CreateFileW(ExtPath(p).c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER li = { { 0, 0 } };
+    GetFileSizeEx(h, &li);
+    if (li.QuadPart <= 0 || li.QuadPart > (LONGLONG)INT_MAX) { CloseHandle(h); return false; }
+    out.resize((size_t)li.QuadPart);
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, out.data(), (DWORD)out.size(), &got, nullptr);
+    CloseHandle(h);
+    if (!ok) { out.clear(); return false; }
+    out.resize(got);
+    return true;
+}
+
+static void WriteRecoverySnapshot() {
+    if (g.stream) return;
+    if (!g.dirty) { DeleteRecoverySnapshot(); return; }
+    std::wstring dir = RecoveryDir();
+    if (dir.empty()) return;
+    EnsureDir(dir);
+    std::wstring file = RecFileFor(g.path);
+    if (file.empty()) return;
+    std::wstring body = L"BARE-RECOVERY-1\n";
+    body += g.path;
+    body += L"\n";
+    body += (g.crlfStyle ? L"1" : L"0");
+    body += (g.endsWithNL ? L"1" : L"0");
+    body += L"\n";
+    body += DocumentText();
+    Enc e;
+    e.kind = Enc::UTF8;
+    e.bom = true;
+    e.skip = 3;
+    std::wstring tmp = file + L".tmp";
+    HANDLE hf = CreateFileW(ExtPath(tmp).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    Writer w(hf);
+    WriteBOM(w, e);
+    WriteEncoded(w, body, e);
+    w.Flush();
+    CloseHandle(hf);
+    if (!w.ok) { DeleteFileW(ExtPath(tmp).c_str()); return; }
+    MoveFileExW(ExtPath(tmp).c_str(), ExtPath(file).c_str(), MOVEFILE_REPLACE_EXISTING);
+    g.editsSinceSnap = 0;
+    g.lastSnapTick = GetTickCount64();
+}
+
+// 从快照恢复到编辑器
+static bool RestoreSnapshot(const std::wstring& file) {
+    std::string bytes;
+    if (!ReadFileBytes(file, bytes) || bytes.empty()) return false;
+    Enc e;
+    e.kind = Enc::UTF8;
+    e.bom = false;
+    e.skip = 0;
+    if (bytes.size() >= 3 && (BYTE)bytes[0] == 0xEF && (BYTE)bytes[1] == 0xBB && (BYTE)bytes[2] == 0xBF) {
+        e.bom = true;
+        e.skip = 3;
+    }
+    std::wstring all = Decode((const BYTE*)bytes.data(), bytes.size(), e);
+    const std::wstring magic = L"BARE-RECOVERY-1";
+    if (all.compare(0, magic.size(), magic) != 0) return false;
+    size_t p1 = all.find(L'\n');
+    size_t p2 = (p1 == std::wstring::npos) ? std::wstring::npos : all.find(L'\n', p1 + 1);
+    size_t p3 = (p2 == std::wstring::npos) ? std::wstring::npos : all.find(L'\n', p2 + 1);
+    if (p3 == std::wstring::npos) return false;
+    std::wstring path = all.substr(p1 + 1, p2 - p1 - 1);
+    std::wstring flags = all.substr(p2 + 1, p3 - p2 - 1);
+    std::wstring text = all.substr(p3 + 1);
+    BuildLines(text, 1);
+    g.crlfStyle = flags.empty() ? true : (flags[0] == L'1');
+    g.endsWithNL = flags.size() > 1 ? (flags[1] == L'1') : false;
+    g.eolName = g.crlfStyle ? L"CRLF" : L"LF";
+    g.path = path;
+    g.enc = Enc();
+    g.dirty = true;
+    g.readOnly = false;
+    g.readOnlyWhy.clear();
+    g.curL = g.curC = 0;
+    g.hasSel = false;
+    g.selecting = false;
+    g.pendingHigh = 0;
+    g.desiredX = -1;
+    g.topL = 0;
+    g.xOffset = 0;
+    g.maxLinePx = 0;
+    g.undo.clear();
+    g.redo.clear();
+    g.savedDepth = 0;
+    g.hasStamp = false;
+    if (!g.path.empty()) UpdateStamp();
+    UpdateTitle();
+    UpdateScroll();
+    Refresh();
+    return true;
+}
+
+static void CheckRecoveryOnStartup() {
+    std::wstring dir = RecoveryDir();
+    if (dir.empty()) return;
+    std::wstring pat = dir + L"\\*.rec";
+    WIN32_FIND_DATAW fd;
+    HANDLE hf = FindFirstFileW(pat.c_str(), &fd);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    std::vector<std::wstring> found;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && found.size() < 8)
+            found.push_back(dir + L"\\" + fd.cFileName);
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+    for (size_t i = 0; i < found.size(); ++i) {
+        std::wstring file = found[i];
+        std::wstring orig;
+        {
+            std::string bytes;
+            if (ReadFileBytes(file, bytes) && !bytes.empty()) {
+                Enc e; e.kind = Enc::UTF8; e.bom = false; e.skip = 0;
+                if (bytes.size() >= 3 && (BYTE)bytes[0] == 0xEF && (BYTE)bytes[1] == 0xBB && (BYTE)bytes[2] == 0xBF) e.skip = 3;
+                std::wstring all = Decode((const BYTE*)bytes.data(), bytes.size(), e);
+                size_t q1 = all.find(L'\n');
+                size_t q2 = (q1 == std::wstring::npos) ? std::wstring::npos : all.find(L'\n', q1 + 1);
+                if (q1 != std::wstring::npos && q2 != std::wstring::npos)
+                    orig = all.substr(q1 + 1, q2 - q1 - 1);
+            }
+        }
+        std::wstring msg = L"检测到上次退出时有未保存的内容";
+        if (!orig.empty()) msg += L"（原文件：" + FileName(orig) + L"）";
+        msg += L"。\n\n是(Y)：恢复到编辑器\n否(N)：删除该快照";
+        if (MessageBoxW(g.hwnd, msg.c_str(), L"Bare · 恢复未保存内容",
+                        MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            if (!RestoreSnapshot(file)) {
+                MessageBoxW(g.hwnd, L"快照已损坏，无法恢复。", L"Bare", MB_OK | MB_ICONWARNING);
+            }
+        }
+        DeleteFileW(ExtPath(file).c_str());
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1146,9 +1637,207 @@ static int VisLines() {
     return std::max(1, (TextBottom() - TextTop()) / g.lineH);
 }
 
+// -----------------------------------------------------------------------------
+// 大文件只读流式模式：不建逐行索引，只在窗口附近解码
+// -----------------------------------------------------------------------------
+static const size_t kStreamBlock = 1024;           // 每 1024 行记录一次字节偏移
+
+static size_t DocLines() {
+    return g.stream ? g.streamLines : g.lines.size();
+}
+
+static bool StreamReadAt(size_t pos, size_t want, std::vector<BYTE>& buf) {
+    if (g.streamFile == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)pos;
+    if (!SetFilePointerEx(g.streamFile, li, nullptr, FILE_BEGIN)) return false;
+    buf.assign(want, 0);
+    DWORD got = 0;
+    if (!ReadFile(g.streamFile, buf.data(), (DWORD)want, &got, nullptr)) return false;
+    buf.resize(got);
+    return true;
+}
+
+// 只读流式模式：分块顺序扫描统计行数并记录稀疏检查点（不驻留全部内容）
+static void StreamCountLines() {
+    g.streamIdx.clear();
+    g.streamLines = 1;
+    g.streamIdx.push_back(0);
+    if (g.streamBytes <= g.streamSkip) return;
+    const size_t kChunk = 1 << 20;
+    std::vector<BYTE> buf(kChunk);
+    size_t pos = g.streamSkip;
+    const bool wide = (g.streamEnc == 3 || g.streamEnc == 4);
+    while (pos < g.streamBytes) {
+        size_t want = kChunk;
+        if (want > g.streamBytes - pos) want = (size_t)(g.streamBytes - pos);
+        if (!StreamReadAt(pos, want, buf) || buf.empty()) break;
+        const size_t n = buf.size();
+        size_t i = 0;
+        while (i < n) {
+            bool nl = false;
+            if (wide) {
+                if (i + 1 >= n) break;
+                unsigned short u = (g.streamEnc == 3)
+                    ? (unsigned short)(buf[i] | ((unsigned short)buf[i + 1] << 8))
+                    : (unsigned short)(buf[i + 1] | ((unsigned short)buf[i] << 8));
+                i += 2;
+                nl = (u == 0x000A);
+            } else {
+                nl = (buf[i] == '\n');
+                ++i;
+            }
+            if (!nl) continue;
+            if (g.streamLines % kStreamBlock == 0)
+                g.streamIdx.push_back(pos + i - g.streamSkip);
+            ++g.streamLines;
+        }
+        pos += n;
+        if (n < want) break;
+    }
+}
+
+static std::wstring StreamDecodeLine(const BYTE* s, size_t len) {
+    std::wstring out;
+    if (len == 0) return out;
+    if (g.streamEnc == 3 || g.streamEnc == 4) {
+        size_t units = len / 2;
+        out.assign(units, 0);
+        for (size_t i = 0; i < units; ++i)
+            out[i] = (g.streamEnc == 3)
+                ? (wchar_t)(s[i * 2] | ((unsigned short)s[i * 2 + 1] << 8))
+                : (wchar_t)(s[i * 2 + 1] | ((unsigned short)s[i * 2] << 8));
+        return out;
+    }
+    if (g.streamEnc == 1) {
+        int wl = MultiByteToWideChar(CP_ACP, 0, (const char*)s, (int)len, nullptr, 0);
+        if (wl > 0) {
+            out.assign((size_t)wl, 0);
+            MultiByteToWideChar(CP_ACP, 0, (const char*)s, (int)len, &out[0], wl);
+        }
+        return out;
+    }
+    int wl = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char*)s, (int)len, nullptr, 0);
+    if (wl > 0) {
+        out.assign((size_t)wl, 0);
+        MultiByteToWideChar(CP_UTF8, 0, (const char*)s, (int)len, &out[0], wl);
+    } else {
+        out.assign(len, 0);
+        for (size_t i = 0; i < len; ++i) out[i] = (wchar_t)s[i];
+    }
+    return out;
+}
+
+static void StreamWindow(size_t top, size_t vis) {
+    if (!g.stream || g.streamFile == INVALID_HANDLE_VALUE) return;
+    if (g.streamLines == 0) { g.lines.assign(1, std::wstring()); g.streamBase = 0; return; }
+    if (top >= g.streamLines) top = g.streamLines - 1;
+    size_t base = (top >= 8) ? top - 8 : 0;
+    size_t block = base / kStreamBlock;
+    if (block >= g.streamIdx.size()) block = g.streamIdx.size() ? g.streamIdx.size() - 1 : 0;
+    const size_t bl = block * kStreamBlock;
+    const size_t pos = g.streamSkip + (g.streamIdx.empty() ? 0 : g.streamIdx[block]);
+    const size_t need = (base - bl) + vis + 64;
+    const bool wide = (g.streamEnc == 3 || g.streamEnc == 4);
+    std::vector<BYTE> buf;
+    std::vector<std::wstring> gotLines;
+    size_t readBytes = 256 * 1024;
+    bool settled = false;
+    while (!settled) {
+        if (readBytes > (16u << 20)) readBytes = 16u << 20;
+        if (!StreamReadAt(pos, readBytes, buf)) break;
+        const size_t n = buf.size();
+        gotLines.clear();
+        size_t i = 0, lineNo = bl, lineStart = 0;
+        bool capped = false;
+        while (i < n) {
+            size_t unitAt = i;
+            bool nl = false;
+            if (wide) {
+                if (i + 1 >= n) { capped = true; break; }
+                unsigned short u = (g.streamEnc == 3)
+                    ? (unsigned short)(buf[i] | ((unsigned short)buf[i + 1] << 8))
+                    : (unsigned short)(buf[i + 1] | ((unsigned short)buf[i] << 8));
+                i += 2;
+                nl = (u == 0x000A);
+            } else {
+                nl = (buf[i] == '\n');
+                ++i;
+            }
+            if (!nl) continue;
+            size_t end = unitAt;
+            if (wide) {
+                if (end >= lineStart + 2) {
+                    unsigned u = (g.streamEnc == 3)
+                        ? (unsigned)(buf[end - 2] | (buf[end - 1] << 8))
+                        : (unsigned)(buf[end - 1] | (buf[end - 2] << 8));
+                    if (u == 0x000D) end -= 2;
+                }
+            } else if (end > lineStart && buf[end - 1] == '\r') {
+                --end;
+            }
+            gotLines.push_back(StreamDecodeLine(buf.data() + lineStart, end - lineStart));
+            lineStart = i;
+            ++lineNo;
+            if (gotLines.size() >= need) break;
+        }
+        const bool eof = (n < readBytes);
+        if (gotLines.size() >= need) { settled = true; break; }
+        if (eof) {
+            // 文件末尾：补上最后一段没有换行的残行
+            if (lineStart < n) {
+                size_t end = n;
+                if (wide) {
+                    if ((end - lineStart) >= 2) end = lineStart + ((end - lineStart) / 2) * 2;
+                } else if (end > lineStart && buf[end - 1] == '\r') {
+                    --end;
+                }
+                gotLines.push_back(StreamDecodeLine(buf.data() + lineStart, end - lineStart));
+            }
+            settled = true;
+            break;
+        }
+        if (capped || gotLines.size() < need) readBytes *= 2;
+    }
+    const size_t skip = base - bl;
+    size_t from = (skip < gotLines.size()) ? skip : gotLines.size();
+    g.lines.assign(gotLines.begin() + (ptrdiff_t)from, gotLines.end());
+    if (g.lines.empty()) g.lines.emplace_back();
+    g.streamBase = base;
+}
+
+static const std::wstring& LineAt(size_t i) {
+    static std::wstring blank;
+    if (!g.stream) {
+        if (i < g.lines.size()) return g.lines[i];
+        blank.clear();
+        return blank;
+    }
+    if (i < g.streamBase || i >= g.streamBase + g.lines.size())
+        StreamWindow(i, (size_t)std::max(1, VisLines()) + 4);
+    if (i < g.streamBase) { blank.clear(); return blank; }
+    size_t k = i - g.streamBase;
+    if (k >= g.lines.size()) { blank.clear(); return blank; }
+    return g.lines[k];
+}
+
+static void CloseStream() {
+    if (g.streamFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(g.streamFile);
+        g.streamFile = INVALID_HANDLE_VALUE;
+    }
+    g.stream = false;
+    g.streamBytes = 0;
+    g.streamLines = 0;
+    g.streamBase = 0;
+    g.streamIdx.clear();
+}
+
 static int MaxTop() {
-    size_t n = g.lines.empty() ? 0 : g.lines.size() - 1;
-    return (int)std::min<size_t>(n, INT_MAX);
+    size_t n = DocLines();
+    size_t page = (size_t)std::max(1, VisLines());
+    size_t m = n > page ? n - page : 0;
+    return (int)std::min<size_t>(m, INT_MAX);
 }
 
 // 测量专用 DC（屏幕兼容），避免反复 GetDC
@@ -1165,7 +1854,7 @@ static void LayoutLine(HDC hdc, size_t l, std::vector<int>& dx,
     breaks.clear();
     breaks.push_back(0);
     static std::wstring d;
-    d = Disp(g.lines[l]);
+    d = Disp(LineAt(l));
     ComputeDx(hdc, d, dx);
     if (!g.wrap || d.size() < 2) return;
     const int fit = FitWidth();
@@ -1180,7 +1869,7 @@ static void LayoutLine(HDC hdc, size_t l, std::vector<int>& dx,
 
 static int LineRows(HDC hdc, size_t l) {
     if (!g.wrap) return 1;
-    if (l >= g.lines.size()) return 1;
+    if (l >= DocLines()) return 1;
     std::vector<int> dx;
     std::vector<size_t> br;
     LayoutLine(hdc, l, dx, br);
@@ -1196,7 +1885,7 @@ static int CaretSeg(const std::vector<size_t>& breaks, size_t col) {
 }
 
 static int CaretXIn(HDC hdc) {
-    std::wstring d = Disp(g.lines[g.curL]);
+    std::wstring d = Disp(LineAt(g.curL));
     std::vector<int> dx;
     ComputeDx(hdc, d, dx);
     size_t c = std::min(g.curC, d.size());
@@ -1229,7 +1918,17 @@ static void UpdateDirty() {
     }
 }
 
+static void UpdateGutter() {
+    size_t n = DocLines();
+    int digits = 1;
+    while (n >= 10) { n /= 10; ++digits; }
+    if (digits < 3) digits = 3;
+    int cw = g.charW > 0 ? g.charW : MulDiv(8, g.dpi, 96);
+    g.gutterW = std::max(MulDiv(42, g.dpi, 96), digits * cw + MulDiv(22, g.dpi, 96));
+}
+
 static void Refresh() {
+    UpdateGutter();
     EnsureCaretVisible();
     UpdateScroll();
     UpdateImePos();
@@ -1254,6 +1953,10 @@ static void AfterEdit() {
     UpdateDirty();
     UpdateTitle();
     Refresh();
+    if (g.dirty) {
+        ++g.editsSinceSnap;
+        if (g.editsSinceSnap >= 60) WriteRecoverySnapshot();
+    }
 }
 
 static void Flash(const wchar_t* s) {
@@ -1263,9 +1966,9 @@ static void Flash(const wchar_t* s) {
 }
 
 static void EnsureCaretVisible() {
-    if (g.lines.empty()) return;
-    g.curL = std::min(g.curL, g.lines.size() - 1);
-    g.curC = std::min(g.curC, VLen(g.lines[g.curL]));
+    if (DocLines() == 0) return;
+    g.curL = std::min(g.curL, DocLines() - 1);
+    g.curC = std::min(g.curC, VLen(LineAt(g.curL)));
     if (g.wrap) g.xOffset = 0;
 
     if (g.curL < g.topL) g.topL = g.curL;
@@ -1303,7 +2006,7 @@ static void EnsureCaretVisible() {
 // 光标在屏幕上的像素位置（左上角）
 static void CaretScreenPos(int& x, int& y) {
     x = g.gutterW; y = TextTop();
-    if (g.lines.empty()) return;
+    if (DocLines() == 0) return;
     HDC hdc = MeasureDC();
     int yy = TextTop();
     if (g.wrap) {
@@ -1313,7 +2016,7 @@ static void CaretScreenPos(int& x, int& y) {
     }
     std::vector<int> dx;
     std::vector<size_t> br;
-    if (g.curL < g.lines.size()) LayoutLine(hdc, g.curL, dx, br);
+    if (g.curL < DocLines()) LayoutLine(hdc, g.curL, dx, br);
     int seg = CaretSeg(br, g.curC);
     size_t segStart = seg < (int)br.size() ? br[seg] : 0;
     size_t c = std::min(g.curC, dx.empty() ? (size_t)0 : dx.size() - 1);
@@ -1329,9 +2032,9 @@ static void MoveVert(int delta, bool ext) {
         if (g.desiredX < 0) g.desiredX = CaretXIn(hdc);
         long long t = (long long)g.curL + delta;
         if (t < 0) t = 0;
-        if (t > (long long)g.lines.size() - 1) t = (long long)g.lines.size() - 1;
+        if (t > (long long)DocLines() - 1) t = (long long)DocLines() - 1;
         size_t nl = (size_t)t;
-        std::wstring d = Disp(g.lines[nl]);
+        std::wstring d = Disp(LineAt(nl));
         std::vector<int> dx;
         ComputeDx(hdc, d, dx);
         g.curL = nl;
@@ -1351,7 +2054,7 @@ static void MoveVert(int delta, bool ext) {
     while (delta > 0) {
         if (seg + 1 < (int)br.size()) {
             ++seg;
-        } else if (g.curL + 1 < g.lines.size()) {
+        } else if (g.curL + 1 < DocLines()) {
             ++g.curL;
             LayoutLine(hdc, g.curL, dx, br);
             seg = 0;
@@ -1369,7 +2072,7 @@ static void MoveVert(int delta, bool ext) {
         ++delta;
     }
     g.desiredX = xInSeg;
-    std::wstring d = Disp(g.lines[g.curL]);
+    std::wstring d = Disp(LineAt(g.curL));
     size_t segStart = br[seg];
     size_t segEnd = (seg + 1 < (int)br.size()) ? br[seg + 1] : d.size();
     size_t c = ColFromX(d, dx, dx[segStart] + xInSeg);
@@ -1433,24 +2136,177 @@ static void UpdateImePos() {
 // -----------------------------------------------------------------------------
 // 查找 / 替换
 // -----------------------------------------------------------------------------
-static bool MatchAt(const std::wstring& s, size_t pos, const std::wstring& q) {
+// 精简正则引擎（ECMAScript 子集：. * + ? [] [^] ^ $ \d \w \s 转义，按行匹配）
+struct RxUnit {
+    int kind = 1;        // 1 字面 2 任意字符 3 字符类 4 行首 5 行尾
+    wchar_t c = 0;
+    bool neg = false;
+    int quant = 0;       // 0 一个 1 * 2 + 3 ?
+    std::vector<std::pair<wchar_t, wchar_t>> ranges;
+};
+
+struct RxProg { std::vector<RxUnit> units; };
+
+static inline bool RxWordChar(wchar_t c) {
+    return (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'z') ||
+           (c >= L'A' && c <= L'Z') || c == L'_' || c > 127;
+}
+
+static void RxAddEscape(RxUnit& u, wchar_t e) {
+    if (e == L'd' || e == L'D') {
+        u.kind = 3; u.neg = (e == L'D');
+        u.ranges.push_back({ L'0', L'9' });
+    } else if (e == L'w' || e == L'W') {
+        u.kind = 3; u.neg = (e == L'W');
+        u.ranges.push_back({ L'0', L'9' });
+        u.ranges.push_back({ L'a', L'z' });
+        u.ranges.push_back({ L'A', L'Z' });
+        u.ranges.push_back({ L'_', L'_' });
+    } else if (e == L's' || e == L'S') {
+        u.kind = 3; u.neg = (e == L'S');
+        u.ranges.push_back({ L' ', L' ' });
+        u.ranges.push_back({ L'\t', L'\t' });
+    } else {
+        u.kind = 1; u.c = e;
+    }
+}
+
+static bool RxCompile(const std::wstring& p, RxProg& pr) {
+    pr.units.clear();
+    for (size_t i = 0; i < p.size(); ++i) {
+        wchar_t c = p[i];
+        RxUnit u;
+        if (c == L'^') { u.kind = 4; pr.units.push_back(u); continue; }
+        if (c == L'$') { u.kind = 5; pr.units.push_back(u); continue; }
+        if (c == L'\\') {
+            if (i + 1 >= p.size()) return false;
+            RxAddEscape(u, p[++i]);
+        } else if (c == L'.') {
+            u.kind = 2;
+        } else if (c == L'[') {
+            u.kind = 3;
+            size_t j = i + 1;
+            if (j < p.size() && p[j] == L'^') { u.neg = true; ++j; }
+            bool first = true;
+            while (j < p.size() && (p[j] != L']' || first)) {
+                first = false;
+                if (p[j] == L'\\' && j + 1 < p.size()) {
+                    RxUnit t;
+                    RxAddEscape(t, p[++j]);
+                    if (t.kind == 3) for (auto& r : t.ranges) u.ranges.push_back(r);
+                    else u.ranges.push_back({ t.c, t.c });
+                    ++j;
+                } else if (j + 2 < p.size() && p[j + 1] == L'-' && p[j + 2] != L']') {
+                    u.ranges.push_back({ p[j], p[j + 2] });
+                    j += 3;
+                } else {
+                    u.ranges.push_back({ p[j], p[j] });
+                    ++j;
+                }
+            }
+            if (j >= p.size()) return false;
+            i = j;
+        } else {
+            u.kind = 1;
+            u.c = c;
+        }
+        if (u.kind >= 1 && u.kind <= 3 && i + 1 < p.size()) {
+            wchar_t q = p[i + 1];
+            if (q == L'*') { u.quant = 1; ++i; }
+            else if (q == L'+') { u.quant = 2; ++i; }
+            else if (q == L'?') { u.quant = 3; ++i; }
+        }
+        pr.units.push_back(u);
+    }
+    return true;
+}
+
+static inline bool RxCharMatch(const RxUnit& u, wchar_t c) {
+    if (u.kind == 2) return c != L'\n' && c != L'\r';
+    if (u.kind == 1) {
+        if (g.find.caseSensitive) return c == u.c;
+        wchar_t a = (c >= L'A' && c <= L'Z') ? (wchar_t)(c - L'A' + L'a') : c;
+        wchar_t b = (u.c >= L'A' && u.c <= L'Z') ? (wchar_t)(u.c - L'A' + L'a') : u.c;
+        return a == b;
+    }
+    bool in = false;
+    for (size_t i = 0; i < u.ranges.size(); ++i)
+        if (c >= u.ranges[i].first && c <= u.ranges[i].second) { in = true; break; }
+    return u.neg ? !in : in;
+}
+
+static bool RxRun(const wchar_t* s, size_t n, size_t pos, const RxProg& pr, size_t ui,
+                  size_t& end, int& budget) {
+    if (--budget < 0) return false;
+    if (ui >= pr.units.size()) { end = pos; return true; }
+    const RxUnit& u = pr.units[ui];
+    if (u.kind == 4) {
+        if (pos != 0) return false;
+        return RxRun(s, n, pos, pr, ui + 1, end, budget);
+    }
+    if (u.kind == 5) {
+        if (pos != n) return false;
+        return RxRun(s, n, pos, pr, ui + 1, end, budget);
+    }
+    int minc = (u.quant == 0 || u.quant == 2) ? 1 : 0;
+    int maxc = (u.quant == 0) ? 1 : (int)(n - pos);
+    int cnt = 0;
+    while (cnt < maxc && pos + (size_t)cnt < n && RxCharMatch(u, s[pos + cnt])) ++cnt;
+    for (int k = cnt; k >= minc; --k) {
+        size_t e = 0;
+        if (RxRun(s, n, pos + (size_t)k, pr, ui + 1, e, budget)) { end = e; return true; }
+    }
+    return false;
+}
+
+static inline bool MatchAt(const std::wstring& s, size_t pos, const std::wstring& q) {
     if (pos + q.size() > s.size()) return false;
     if (g.find.caseSensitive)
         return wmemcmp(s.data() + pos, q.data(), q.size()) == 0;
     return _wcsnicmp(s.data() + pos, q.data(), q.size()) == 0;
 }
 
-static void CollectLineHits(size_t line, std::vector<size_t>& cols) {
-    cols.clear();
+static bool WordOk(const wchar_t* s, size_t n, size_t c, size_t len) {
+    if (!g.find.wholeWord) return true;
+    if (c > 0 && RxWordChar(s[c - 1])) return false;
+    if (c + len < n && RxWordChar(s[c + len])) return false;
+    return true;
+}
+
+static void CollectLineHits(size_t line, std::vector<std::pair<size_t, size_t>>& out,
+                            const RxProg* prog) {
+    out.clear();
     const std::wstring& ln = g.lines[line];
     const std::wstring& q = g.find.q;
     size_t vl = VLen(ln);
-    if (q.empty() || vl < q.size()) return;
-    size_t last = vl - q.size();
-    for (size_t c = 0; c <= last; ++c) {
-        if (!MatchAt(ln, c, q)) continue;
-        cols.push_back(c);
-        c += q.size() - 1;
+    if (q.empty() || vl == 0) return;
+    const wchar_t* s = ln.c_str();
+    if (prog) {
+        size_t c = 0;
+        for (;;) {
+            size_t start = c, e = 0;
+            bool found = false;
+            while (start <= vl) {
+                int budget = 200000;
+                if (RxRun(s, vl, start, *prog, 0, e, budget) && WordOk(s, vl, start, e - start)) {
+                    found = true;
+                    break;
+                }
+                ++start;
+            }
+            if (!found) break;
+            out.push_back(std::make_pair(start, e - start));
+            c = (e > start) ? e : start + 1;
+            if (c > vl) break;
+        }
+    } else {
+        if (vl < q.size()) return;
+        for (size_t c = 0; c + q.size() <= vl; ++c) {
+            if (!MatchAt(ln, c, q)) continue;
+            if (!WordOk(s, vl, c, q.size())) continue;
+            out.push_back(std::make_pair(c, q.size()));
+            c += q.size() - 1;
+        }
     }
 }
 
@@ -1460,13 +2316,24 @@ static void RebuildFindHits() {
     F.current = -1;
     F.truncated = false;
     F.dirtyHits = false;
+    F.regexError = false;
     if (F.q.empty()) return;
+    RxProg prog;
+    const RxProg* pp = nullptr;
+    if (F.regexMode) {
+        if (!RxCompile(F.q, prog) || prog.units.empty()) { F.regexError = true; return; }
+        pp = &prog;
+    }
     const size_t kCap = 100000;
-    std::vector<size_t> cols;
+    std::vector<std::pair<size_t, size_t>> lineHits;
     for (size_t l = 0; l < g.lines.size(); ++l) {
-        CollectLineHits(l, cols);
-        for (size_t c : cols) {
-            F.hits.emplace_back(l, c);
+        CollectLineHits(l, lineHits, pp);
+        for (size_t k = 0; k < lineHits.size(); ++k) {
+            FindHit h;
+            h.line = l;
+            h.col = lineHits[k].first;
+            h.len = lineHits[k].second;
+            F.hits.push_back(h);
             if (F.hits.size() >= kCap) { F.truncated = true; return; }
         }
     }
@@ -1476,10 +2343,10 @@ static void SelectHit(size_t idx) {
     FindState& F = g.find;
     if (idx >= F.hits.size()) return;
     F.current = (int)idx;
-    g.anchorL = F.hits[idx].first;
-    g.anchorC = F.hits[idx].second;
-    g.curL = F.hits[idx].first;
-    g.curC = F.hits[idx].second + F.q.size();
+    g.anchorL = F.hits[idx].line;
+    g.anchorC = F.hits[idx].col;
+    g.curL = F.hits[idx].line;
+    g.curC = F.hits[idx].col + F.hits[idx].len;
     g.hasSel = true;
     g.desiredX = -1;
     Refresh();
@@ -1502,7 +2369,7 @@ static void FindNav(bool forward) {
             bool found = false;
             for (size_t i = 0; i < n; ++i) {
                 const auto& h = F.hits[i];
-                if (h.first > g.curL || (h.first == g.curL && h.second >= g.curC)) {
+                if (h.line > g.curL || (h.line == g.curL && h.col >= g.curC)) {
                     idx = i; found = true; break;
                 }
             }
@@ -1511,7 +2378,7 @@ static void FindNav(bool forward) {
             idx = 0;
             for (size_t i = n; i-- > 0;) {
                 const auto& h = F.hits[i];
-                if (h.first < g.curL || (h.first == g.curL && h.second < g.curC)) {
+                if (h.line < g.curL || (h.line == g.curL && h.col < g.curC)) {
                     idx = i; break;
                 }
             }
@@ -1540,6 +2407,7 @@ static void SyncFindHeight() {
 }
 
 static void OpenFind(bool replaceMode) {
+    if (g.stream) { Flash(L"只读快速模式不支持查找"); return; }
     bool was = g.find.open;
     if (g.gotoOpen) { g.gotoOpen = false; g.gotoText.clear(); }
     g.find.open = true;
@@ -1611,6 +2479,7 @@ static void PasteToField() {
 }
 
 static void ReplaceCurrent() {
+    if (!EditAllowed()) return;
     FindState& F = g.find;
     if (F.q.empty()) return;
     if (F.dirtyHits) RebuildFindHits();
@@ -1618,37 +2487,43 @@ static void ReplaceCurrent() {
         FindNav(true);
         if (F.current < 0) return;
     }
-    auto h = F.hits[F.current];
-    EditRange(h.first, h.second, h.first, h.second + F.q.size(), F.rep, false);
+    FindHit h = F.hits[F.current];
+    EditRange(h.line, h.col, h.line, h.col + h.len, F.rep, false);
     F.dirtyHits = true;
     F.current = -1;
     FindNav(true);
 }
 
 static void ReplaceAll() {
+    if (!EditAllowed()) return;
     FindState& F = g.find;
     if (F.q.empty()) return;
     if (F.dirtyHits) RebuildFindHits();
+    if (F.regexMode && F.regexError) { Flash(L"正则表达式有误"); return; }
     size_t cnt = F.hits.size();
     if (cnt == 0) { Flash(L"没有可替换的内容"); return; }
     if (cnt > 30000 || g.lines.size() > 200000) {
         std::wstring m = L"即将替换 " + std::to_wstring(cnt) + L" 处内容，是否继续？";
         if (MessageBoxW(g.hwnd, m.c_str(), L"Bare", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
     }
-    std::wstring oldText = DocumentText();
     std::wstring out;
-    out.reserve(oldText.size() + cnt * F.rep.size());
-    size_t i = 0;
-    while (i < oldText.size()) {
-        if (i + F.q.size() <= oldText.size() && MatchAt(oldText, i, F.q)) {
-            out += F.rep;
-            i += F.q.size();
-        } else {
-            out.push_back(oldText[i]);
-            ++i;
+    size_t hi = 0;
+    for (size_t l = 0; l < g.lines.size(); ++l) {
+        const std::wstring& ln = g.lines[l];
+        size_t base = 0;
+        while (hi < F.hits.size() && F.hits[hi].line == l) {
+            size_t a = F.hits[hi].col, b = a + F.hits[hi].len;
+            if (a >= base && b <= ln.size()) {
+                out.append(ln, base, a - base);
+                out += F.rep;
+                base = b;
+            }
+            ++hi;
         }
+        out.append(ln, base, std::wstring::npos);
+        if (l + 1 < g.lines.size()) out += L'\n';
     }
-    if (out == oldText) return;
+    if (out == DocumentText()) return;
     HCURSOR wc = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
     size_t hint = 1;
     for (wchar_t c : out) if (c == L'\n') ++hint;
@@ -1661,9 +2536,64 @@ static void ReplaceAll() {
     Flash(msg.c_str());
 }
 
+// 打印（Ctrl+P / 右键菜单）
+static void DoPrint() {
+    PRINTDLGW pd = { 0 };
+    pd.lStructSize = sizeof(pd);
+    pd.hwndOwner = g.hwnd;
+    pd.Flags = PD_RETURNDC | PD_NOSELECTION | PD_NOPAGENUMS | PD_NOWARNING;
+    if (!PrintDlgW(&pd)) return;
+    HDC hdc = pd.hDC;
+    if (!hdc) return;
+    std::wstring text = DocumentText();
+    if (text.empty()) text = L" ";
+    int dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
+    int dpiY = GetDeviceCaps(hdc, LOGPIXELSY);
+    int lh = -MulDiv(10, dpiY, 72);
+    HFONT f = CreateFontW(lh, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                          FIXED_PITCH | FF_MODERN, L"Consolas");
+    HGDIOBJ of = SelectObject(hdc, f);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(0, 0, 0));
+    int mgx = MulDiv(15, dpiX, 96);
+    int mgy = MulDiv(15, dpiY, 96);
+    int pw = GetDeviceCaps(hdc, HORZRES);
+    int ph = GetDeviceCaps(hdc, VERTRES);
+    int pageH = ph - mgy * 2;
+    if (pageH <= 0) { SelectObject(hdc, of); DeleteObject(f); DeleteDC(hdc); return; }
+    RECT calc = { 0, 0, pw - mgx * 2, 0 };
+    DrawTextW(hdc, text.c_str(), (int)text.size(), &calc,
+              DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    int total = calc.bottom;
+    int pages = (total <= 0) ? 1 : (total + pageH - 1) / pageH;
+    std::wstring docName = g.path.empty() ? std::wstring(L"未命名") : FileName(g.path);
+    DOCINFOW di = { 0 };
+    di.cbSize = sizeof(di);
+    di.lpszDocName = docName.c_str();
+    if (StartDocW(hdc, &di) > 0) {
+        for (int p = 0; p < pages; ++p) {
+            if (StartPage(hdc) <= 0) break;
+            int off = p * pageH;
+            SetViewportOrgEx(hdc, mgx, mgy - off, nullptr);
+            RECT tr = { 0, off, pw - mgx * 2, off + pageH };
+            DrawTextW(hdc, text.c_str(), (int)text.size(), &tr,
+                      DT_WORDBREAK | DT_NOPREFIX);
+            SetViewportOrgEx(hdc, 0, 0, nullptr);
+            EndPage(hdc);
+        }
+        EndDoc(hdc);
+    }
+    SelectObject(hdc, of);
+    DeleteObject(f);
+    DeleteDC(hdc);
+    if (pd.hDevMode) GlobalFree(pd.hDevMode);
+    if (pd.hDevNames) GlobalFree(pd.hDevNames);
+}
+
 // 查找栏布局
 struct FindLayout {
-    RECT field, up, down, aa, close;
+    RECT field, up, down, aa, rx, ww, close;
     RECT repField, repl, replAll, fromStart;
 };
 
@@ -1678,6 +2608,8 @@ static FindLayout FindRects() {
     L.close = { x - rh, y1, x, y1 + rh }; x -= rh + gap * 2;
     int aw = MulDiv(30, g.dpi, 96);
     L.aa = { x - aw, y1, x, y1 + rh }; x -= aw + gap;
+    L.ww = { x - aw, y1, x, y1 + rh }; x -= aw + gap;
+    L.rx = { x - aw, y1, x, y1 + rh }; x -= aw + gap;
     L.down = { x - rh, y1, x, y1 + rh }; x -= rh + gap;
     L.up = { x - rh, y1, x, y1 + rh }; x -= rh + MulDiv(12, g.dpi, 96);
     int fw = MulDiv(360, g.dpi, 96);
@@ -1746,9 +2678,9 @@ static void DoGoto() {
         if (!readNum(col)) col = 1;
     }
     CloseGoto();
-    if (g.lines.empty()) return;
-    const size_t l = (size_t)std::min<long>(std::max<long>(line, 1) - 1, (long)g.lines.size() - 1);
-    const size_t vl = VLen(g.lines[l]);
+    if (DocLines() == 0) return;
+    const size_t l = (size_t)std::min<long>(std::max<long>(line, 1) - 1, (long)DocLines() - 1);
+    const size_t vl = VLen(LineAt(l));
     size_t c = (size_t)std::max<long>(col, 1) - 1;
     if (c > vl) c = vl;
     g.hasSel = false;
@@ -1797,6 +2729,7 @@ static void ShowEncodingMenu(POINT pt) {
 }
 
 static void ConvertEol(bool toCrlf) {
+    if (!EditAllowed()) return;
     bool changed = false;
     for (size_t i = 0; i < g.lines.size(); ++i) {
         bool hasNL = (i + 1 < g.lines.size()) || g.endsWithNL;
@@ -1862,7 +2795,15 @@ static inline bool HasSelection() {
     return g.hasSel && !(g.anchorL == g.curL && g.anchorC == g.curC);
 }
 
+// 只读 / 流式模式禁止任何修改
+static bool EditAllowed() {
+    if (g.stream) { Flash(L"只读快速模式：不能编辑"); return false; }
+    if (g.readOnly) { Flash(L"只读模式：不能编辑"); return false; }
+    return true;
+}
+
 static void InsertText(const std::wstring& s, bool typed) {
+    if (!EditAllowed()) return;
     if (s.empty()) return;
     size_t l1 = g.curL, c1 = g.curC, l2 = g.curL, c2 = g.curC;
     if (HasSelection()) GetSel(l1, c1, l2, c2);
@@ -1870,6 +2811,7 @@ static void InsertText(const std::wstring& s, bool typed) {
 }
 
 static void KeyBackspace() {
+    if (!EditAllowed()) return;
     if (HasSelection()) {
         size_t l1, c1, l2, c2;
         GetSel(l1, c1, l2, c2);
@@ -1887,6 +2829,7 @@ static void KeyBackspace() {
 }
 
 static void KeyDelete() {
+    if (!EditAllowed()) return;
     if (HasSelection()) {
         size_t l1, c1, l2, c2;
         GetSel(l1, c1, l2, c2);
@@ -1911,6 +2854,7 @@ static inline bool IsWordChar(wchar_t c) {
 }
 
 static void KeyBackspaceWord() {
+    if (!EditAllowed()) return;
     if (HasSelection()) {
         size_t l1, c1, l2, c2;
         GetSel(l1, c1, l2, c2);
@@ -1928,6 +2872,7 @@ static void KeyBackspaceWord() {
 }
 
 static void KeyDeleteWord() {
+    if (!EditAllowed()) return;
     if (HasSelection()) {
         size_t l1, c1, l2, c2;
         GetSel(l1, c1, l2, c2);
@@ -1946,6 +2891,7 @@ static void KeyDeleteWord() {
 }
 
 static void CopySel(bool cut) {
+    if (cut && !EditAllowed()) return;
     if (!HasSelection()) return;
     size_t l1, c1, l2, c2;
     GetSel(l1, c1, l2, c2);
@@ -1972,6 +2918,7 @@ static void CopySel(bool cut) {
 }
 
 static void Paste() {
+    if (!EditAllowed()) return;
     std::wstring t;
     if (OpenClipboard(g.hwnd)) {
         HANDLE h = GetClipboardData(CF_UNICODETEXT);
@@ -2025,17 +2972,18 @@ static void MoveHoriz(int dir, bool ext) {
 
 static void MoveHomeEnd(bool end, bool ctrl, bool ext) {
     if (ext && !g.hasSel) { g.anchorL = g.curL; g.anchorC = g.curC; }
+    const size_t total = DocLines();
     if (ctrl) {
-        g.curL = end ? g.lines.size() - 1 : 0;
-        g.curC = end ? VLen(g.lines[g.curL]) : 0;
+        g.curL = end ? (total ? total - 1 : 0) : 0;
+        g.curC = end ? VLen(LineAt(g.curL)) : 0;
     } else if (!end) {
+        const std::wstring ln = LineAt(g.curL);
         size_t first = 0;
-        size_t vl = VLen(g.lines[g.curL]);
-        while (first < vl && (g.lines[g.curL][first] == L' ' || g.lines[g.curL][first] == L'\t'))
-            ++first;
+        size_t vl = VLen(ln);
+        while (first < vl && (ln[first] == L' ' || ln[first] == L'\t')) ++first;
         g.curC = (g.curC == first) ? 0 : first;
     } else {
-        g.curC = VLen(g.lines[g.curL]);
+        g.curC = VLen(LineAt(g.curL));
     }
     g.hasSel = ext;
     AfterMove(true);
@@ -2201,10 +3149,10 @@ static StatusLayout StatusRects(HDC hdc, int y) {
     StatusLayout L = {};
     HGDIOBJ of = SelectObject(hdc, g.hUI);
     std::wstring sPos = L"行 " + std::to_wstring(g.curL + 1) + L", 列 " + std::to_wstring(g.curC + 1);
-    std::wstring sLines = std::to_wstring(g.lines.size()) + L" 行";
+    std::wstring sLines = std::to_wstring(DocLines()) + L" 行";
     std::wstring sEnc = g.enc.Name();
     std::wstring sEol = g.eolName;
-    std::wstring sDirty = g.dirty ? L"已修改" : L"未修改";
+    std::wstring sDirty = g.readOnly ? L"\U0001F512 只读" : (g.dirty ? L"已修改" : L"未修改");
     if (!g.flash.empty() && GetTickCount64() < g.flashUntil) sDirty = g.flash;
     int pad = MulDiv(18, g.dpi, 96);
     int wPos = TW(hdc, sPos), wLines = TW(hdc, sLines), wEnc = TW(hdc, sEnc);
@@ -2261,7 +3209,7 @@ static void DrawStatus(HDC h) {
               -1, &L.pos, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     if (L.lines.right > L.lines.left) {
         SetTextColor(h, g.cStatusText);
-        DrawTextW(h, (std::to_wstring(g.lines.size()) + L" 行").c_str(), -1, &L.lines,
+        DrawTextW(h, (std::to_wstring(DocLines()) + L" 行").c_str(), -1, &L.lines,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
     if (L.enc.right > L.enc.left) {
@@ -2274,7 +3222,8 @@ static void DrawStatus(HDC h) {
     }
     bool flashing = !g.flash.empty() && GetTickCount64() < g.flashUntil;
     SetTextColor(h, flashing ? g.cAccent : (g.dirty ? g.cAccent : g.cStatusText));
-    std::wstring sDirty = flashing ? g.flash : (g.dirty ? L"已修改" : L"未修改");
+    std::wstring sDirty = flashing ? g.flash
+                        : (g.readOnly ? L"\U0001F512 只读" : (g.dirty ? L"已修改" : L"未修改"));
     DrawTextW(h, sDirty.c_str(), -1, &L.dirty, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     // 分段之间的圆点
@@ -2401,6 +3350,7 @@ static void DrawFindBar(HDC h) {
     std::wstring cnt;
     if (!g.find.q.empty()) {
         if (g.find.dirtyHits) cnt = L"…";
+        else if (g.find.regexMode && g.find.regexError) cnt = L"正则有误";
         else if (g.find.hits.empty()) cnt = L"无结果";
         else {
             int cur = (g.find.current < 0) ? 1 : g.find.current + 1;
@@ -2409,7 +3359,7 @@ static void DrawFindBar(HDC h) {
         }
     }
     RECT cr = { L.field.right + MulDiv(8, g.dpi, 96), L.field.top,
-                L.up.left - MulDiv(6, g.dpi, 96), L.field.bottom };
+                L.rx.left - MulDiv(6, g.dpi, 96), L.field.bottom };
     SetTextColor(h, g.cStatusText);
     DrawTextW(h, cnt.c_str(), -1, &cr,
               DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -2436,6 +3386,8 @@ static void DrawFindBar(HDC h) {
     btn(L.up, 1, L"▲", false, false);
     btn(L.down, 2, L"▼", false, false);
     btn(L.aa, 3, L"Aa", g.find.caseSensitive, g.find.caseSensitive);
+    btn(L.rx, 9, L".*", g.find.regexMode, g.find.regexMode);
+    btn(L.ww, 10, L"ab", g.find.wholeWord, g.find.wholeWord);
     btn(L.close, 4, L"×", false, false);
     if (g.find.replaceMode) {
         btn(L.repl, 5, L"替换", false, false);
@@ -2512,14 +3464,18 @@ static void Paint(HWND hwnd) {
 
     std::vector<int> dx;
     std::vector<size_t> br;
-    std::vector<size_t> fmatch;
+    std::vector<std::pair<size_t, size_t>> fmatch;
     std::vector<std::pair<size_t, int>> gutterNums;
     int y = textTop;
     int caretX = 0, caretY = 0;
     bool caretDrawn = false;
+    RxProg paProg;
+    const RxProg* paPP = nullptr;
+    if (findOn && g.find.regexMode && RxCompile(g.find.q, paProg)) paPP = &paProg;
 
-    for (size_t i = g.topL; i < g.lines.size(); ++i) {
-        std::wstring d = Disp(g.lines[i]);
+    if (g.stream) StreamWindow(g.topL, (size_t)VisLines() + 4);
+    for (size_t i = g.topL; i < DocLines(); ++i) {
+        std::wstring d = Disp(LineAt(i));
         ComputeDx(mem, d, dx);
         br.clear();
         br.push_back(0);
@@ -2534,17 +3490,7 @@ static void Paint(HWND hwnd) {
         if (!g.wrap && !dx.empty() && dx.back() > g.maxLinePx) g.maxLinePx = dx.back();
 
         // 本行所有查找命中
-        fmatch.clear();
-        if (findOn) {
-            const std::wstring& q = g.find.q;
-            if (dlen >= q.size()) {
-                for (size_t c = 0; c + q.size() <= dlen; ++c) {
-                    if (!MatchAt(g.lines[i], c, q)) continue;
-                    fmatch.push_back(c);
-                    c += q.size() - 1;
-                }
-            }
-        }
+        if (findOn) CollectLineHits(i, fmatch, paPP);
 
         for (size_t k = 0; k < br.size(); ++k) {
             if (y >= textBottom) break;
@@ -2572,13 +3518,14 @@ static void Paint(HWND hwnd) {
             // 查找高亮（当前命中由选区标示）
             if (findOn) {
                 int curIdx = g.find.dirtyHits ? -1 : g.find.current;
-                for (size_t m : fmatch) {
+                for (size_t fi = 0; fi < fmatch.size(); ++fi) {
+                    size_t m = fmatch[fi].first;
                     if (m < segStart || m >= segEnd) continue;
                     bool isCur = curIdx >= 0 && (size_t)curIdx < g.find.hits.size() &&
-                                 g.find.hits[curIdx].first == i &&
-                                 g.find.hits[curIdx].second == m;
+                                 g.find.hits[curIdx].line == i &&
+                                 g.find.hits[curIdx].col == m;
                     if (isCur) continue;
-                    size_t me = std::min(m + g.find.q.size(), dlen);
+                    size_t me = std::min(m + fmatch[fi].second, dlen);
                     RECT fr = { g.gutterW + dx[m] - dx[segStart] - g.xOffset, y,
                                 g.gutterW + dx[me] - dx[segStart] - g.xOffset, y + g.lineH };
                     HBRUSH hb = CreateSolidBrush(g.cFind);
@@ -2593,6 +3540,21 @@ static void Paint(HWND hwnd) {
                 ExtTextOutW(mem, g.gutterW - g.xOffset,
                             y + (g.lineH - g.fontPx) / 2, 0, nullptr,
                             d.c_str() + segStart, (UINT)(segEnd - segStart), nullptr);
+            }
+
+            // 空白字符可视化（空格 ·、Tab →）
+            if (g.showWs && segEnd > segStart) {
+                SetTextColor(mem, g.cGutterText);
+                for (size_t c = segStart; c < segEnd; ++c) {
+                    wchar_t ch = d[c];
+                    if (ch != L' ' && ch != L'\t') continue;
+                    int cx = g.gutterW + dx[c] - dx[segStart] - g.xOffset;
+                    if (cx < g.gutterW || cx > rc.right) continue;
+                    const wchar_t* mark = (ch == L' ') ? L"\u00B7" : L"\u2192";
+                    ExtTextOutW(mem, cx, y + (g.lineH - g.fontPx) / 2, 0, nullptr,
+                                mark, 1, nullptr);
+                }
+                SetTextColor(mem, g.cText);
             }
 
             // 行尾符号
@@ -2664,22 +3626,22 @@ static void Paint(HWND hwnd) {
 // 鼠标定位
 // -----------------------------------------------------------------------------
 static void MouseToCaret(int x, int y, bool ext) {
-    if (g.lines.empty()) return;
+    if (DocLines() == 0) return;
     HDC hdc = MeasureDC();
-    size_t l = g.lines.size() - 1;
+    size_t l = DocLines() - 1;
     size_t col = 0;
 
     if (g.wrap) {
         int yy = TextTop();
         size_t i = g.topL;
-        for (; i < g.lines.size(); ++i) {
+        for (; i < DocLines(); ++i) {
             int rows = LineRows(hdc, i);
             if (y < yy + rows * g.lineH) break;
             yy += rows * g.lineH;
         }
-        if (i >= g.lines.size()) {
-            l = g.lines.size() - 1;
-            col = VLen(g.lines[l]);
+        if (i >= DocLines()) {
+            l = DocLines() - 1;
+            col = VLen(LineAt(l));
         } else {
             l = i;
             std::vector<int> dx;
@@ -2690,7 +3652,7 @@ static void MouseToCaret(int x, int y, bool ext) {
             if (rowInLine >= (int)br.size()) rowInLine = (int)br.size() - 1;
             size_t segStart = br[rowInLine];
             size_t segEnd = (rowInLine + 1 < (int)br.size()) ? br[rowInLine + 1] : dx.size() - 1;
-            std::wstring d = Disp(g.lines[i]);
+            std::wstring d = Disp(LineAt(i));
             size_t c = ColFromX(d, dx, x - g.gutterW + g.xOffset + dx[segStart]);
             col = std::min(std::max(c, segStart), std::min(segEnd, d.size()));
         }
@@ -2698,8 +3660,8 @@ static void MouseToCaret(int x, int y, bool ext) {
         int row = (y - TextTop()) / g.lineH;
         if (row < 0) row = 0;
         l = g.topL + (size_t)row;
-        if (l >= g.lines.size()) l = g.lines.size() - 1;
-        std::wstring d = Disp(g.lines[l]);
+        if (l >= DocLines()) l = DocLines() - 1;
+        std::wstring d = Disp(LineAt(l));
         std::vector<int> dx;
         ComputeDx(hdc, d, dx);
         col = ColFromX(d, dx, x - g.gutterW + g.xOffset);
@@ -2714,7 +3676,7 @@ static void MouseToCaret(int x, int y, bool ext) {
 }
 
 static void SelectWordAt(size_t l, size_t c) {
-    const std::wstring& ln = g.lines[l];
+    const std::wstring ln = LineAt(l);
     size_t vl = VLen(ln);
     size_t a = std::min(c, vl), b = a;
     if (a < vl && IsWordChar(ln[a])) {
@@ -2908,6 +3870,19 @@ static void ShowContextMenu(POINT pt) {
     POINT sp = pt;
     ClientToScreen(g.hwnd, &sp);
     HMENU m = CreatePopupMenu();
+    HMENU mru = CreatePopupMenu();
+    for (size_t i = 0; i < g.mru.size() && i < 10; ++i) {
+        std::wstring label = std::to_wstring(i + 1) + L". " + FileName(g.mru[i]);
+        AppendMenuW(mru, MF_STRING, 20 + (UINT)i, label.c_str());
+    }
+    if (g.mru.empty()) {
+        AppendMenuW(mru, MF_STRING | MF_GRAYED, 19, L"（空）");
+    } else {
+        AppendMenuW(mru, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(mru, MF_STRING, 30, L"清除最近记录");
+    }
+    AppendMenuW(m, MF_POPUP | MF_STRING, (UINT_PTR)mru, L"最近打开");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (g.undo.empty() ? MF_GRAYED : 0), 1, L"撤销\tCtrl+Z");
     AppendMenuW(m, MF_STRING | (g.redo.empty() ? MF_GRAYED : 0), 2, L"重做\tCtrl+Y");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -2918,10 +3893,25 @@ static void ShowContextMenu(POINT pt) {
     AppendMenuW(m, MF_STRING, 6, L"全选\tCtrl+A");
     AppendMenuW(m, MF_STRING, 7, L"查找\tCtrl+F");
     AppendMenuW(m, MF_STRING, 8, L"查找并替换\tCtrl+H");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (g.showWs ? MF_CHECKED : 0), 9, L"显示空白字符");
+    AppendMenuW(m, MF_STRING, 31, L"打印\tCtrl+P");
     int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                   sp.x, sp.y, 0, g.hwnd, nullptr);
+    DestroyMenu(mru);
     DestroyMenu(m);
+    if (cmd >= 20 && cmd < 30) {
+        size_t idx = (size_t)(cmd - 20);
+        if (idx < g.mru.size()) {
+            std::wstring p = g.mru[idx];
+            if (ShouldOpenNewWindow()) LaunchNewWindow(p);
+            else LoadFile(p);
+        }
+        return;
+    }
     switch (cmd) {
+        case 19: break;
+        case 30: g.mru.clear(); SaveMru(); break;
         case 1: UndoRedo(false); break;
         case 2: UndoRedo(true); break;
         case 3: CopySel(true); break;
@@ -2930,6 +3920,12 @@ static void ShowContextMenu(POINT pt) {
         case 6: SelectAll(); break;
         case 7: OpenFind(false); break;
         case 8: OpenFind(true); break;
+        case 9:
+            g.showWs = !g.showWs;
+            CfgPutDword(L"ShowWs", g.showWs ? 1 : 0);
+            Refresh();
+            break;
+        case 31: DoPrint(); break;
         default: break;
     }
 }
@@ -2939,14 +3935,18 @@ static void ShowContextMenu(POINT pt) {
 // -----------------------------------------------------------------------------
 static void CheckExternalChange() {
     if (g.path.empty() || !g.hasStamp || g.watching) return;
+    if (g.stream) return;
     FILETIME ft;
     unsigned long long sz = 0;
     if (!GetStamp(g.path, ft, sz)) return;
     if (CompareFileTime(&ft, &g.stamp) == 0 && sz == g.fileSize) return;
 
     g.watching = true;
-    std::wstring msg = L"文件「" + FileName(g.path) +
-                       L"」已被其他程序修改。\n\n是(Y)：重新载入最新内容\n否(N)：保持当前内容";
+    std::wstring msg = L"文件「" + FileName(g.path) + L"」已被其他程序修改。\n\n";
+    msg += L"磁盘上的文件现在 " + FmtSize(sz) + L"（原 " + FmtSize(g.fileSize) + L"）";
+    if (g.dirty) msg += L"，编辑器中还有未保存的修改。\n\n";
+    else msg += L"，编辑器内容没有改动。\n\n";
+    msg += L"是(Y)：重新载入磁盘上的最新内容\n否(N)：保持当前内容（并忽略本次变更）";
     int r = MessageBoxW(g.hwnd, msg.c_str(), L"Bare · 文件已变更",
                         MB_YESNO | MB_ICONINFORMATION);
     // 注意：MessageBox 会跑消息循环，期间 WM_TIMER 仍会进来；g.watching 必须保持到
@@ -3030,6 +4030,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DragAcceptFiles(hwnd, TRUE);
             SetTimer(hwnd, 1, 530, nullptr);
             SetTimer(hwnd, 3, 1200, nullptr);
+            SetTimer(hwnd, 5, 30000, nullptr);
             UpdateTitle();
             UpdateScroll();
 
@@ -3039,6 +4040,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (argc > 1 && argv[1][0]) LoadFile(argv[1]);
                 LocalFree(argv);
             }
+            CheckRecoveryOnStartup();
             return 0;
         }
 
@@ -3096,6 +4098,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g.find.open && g.find.dirtyHits) FindNav(true);
             } else if (wp == 3) {
                 CheckExternalChange();
+            } else if (wp == 5) {
+                if (g.dirty) WriteRecoverySnapshot();
             }
             return 0;
 
@@ -3226,6 +4230,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     case L'X': CopySel(true); return 0;
                     case L'V': Paste(); return 0;
                     case L'T': ToggleTopmost(); return 0;
+                    case L'P': DoPrint(); return 0;
                     case L'W': PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0;
                     default: break;
                 }
@@ -3268,6 +4273,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     CloseFind();
                 } else if (PtInRect(&fl.aa, pt)) {
                     g.find.caseSensitive = !g.find.caseSensitive;
+                    g.find.dirtyHits = true;
+                    g.find.current = -1;
+                    if (!g.find.q.empty()) FindNav(true);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else if (PtInRect(&fl.rx, pt)) {
+                    g.find.regexMode = !g.find.regexMode;
+                    g.find.dirtyHits = true;
+                    g.find.current = -1;
+                    if (!g.find.q.empty()) FindNav(true);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else if (PtInRect(&fl.ww, pt)) {
+                    g.find.wholeWord = !g.find.wholeWord;
                     g.find.dirtyHits = true;
                     g.find.current = -1;
                     if (!g.find.q.empty()) FindNav(true);
@@ -3445,6 +4462,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int fb = 0;
                 if (PtInRect(&fl.close, pt)) fb = 4;
                 else if (PtInRect(&fl.aa, pt)) fb = 3;
+                else if (PtInRect(&fl.rx, pt)) fb = 9;
+                else if (PtInRect(&fl.ww, pt)) fb = 10;
                 else if (PtInRect(&fl.up, pt)) fb = 1;
                 else if (PtInRect(&fl.down, pt)) fb = 2;
                 else if (g.find.replaceMode && PtInRect(&fl.repl, pt)) fb = 5;
@@ -3562,13 +4581,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CLOSE:
             CaptureWindowRect();
             SaveSettings();
-            if (ConfirmDiscard()) DestroyWindow(hwnd);
+            if (ConfirmDiscard()) {
+                DeleteRecoverySnapshot();
+                DestroyWindow(hwnd);
+            }
             return 0;
 
         case WM_DESTROY:
+            CloseStream();
             KillTimer(hwnd, 1);
             KillTimer(hwnd, 2);
             KillTimer(hwnd, 3);
+            KillTimer(hwnd, 5);
             if (g.hMono)   DeleteObject(g.hMono);
             if (g.hUI)     DeleteObject(g.hUI);
             if (g.hUIBold) DeleteObject(g.hUIBold);
